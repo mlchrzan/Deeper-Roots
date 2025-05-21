@@ -1193,6 +1193,18 @@ test_new_w_preds |>
   filter(extreme_closure_10pct_over_5yr == 'X1')
 ```
 
+```{r case_study_PA}
+test_new_w_preds |> 
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         state = data_5yr_base_omit_splits$test_original$dist_state_abbr,
+         .before = year) |> 
+  filter(state == "PA") |> 
+  filter(correct_pred==F)
+  filter(extreme_closure_10pct_over_5yr == 'X1') |> 
+  filter(num_schools > 3) |> 
+  count(correct_pred)
+```
+
 ```{r case_study_CA}
 # data_imputed <- readRDS("../Sherlock/imputations_TRAIN_full2.rds")
 
