@@ -1,0 +1,527 @@
+---
+title: "EDA"
+format: html
+editor: visual
+---
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(naniar) #for missing data analysis
+library(GGally) #for correlation matrix
+library(corrplot) #for correlation matrix
+```
+
+# Data Checks
+
+```{r correlations}
+corrplot(cor(na.omit(dplyr::select(closure_dist, where(is.numeric)))), 
+         method = "color", 
+         type = "full",    
+         diag = TRUE,      
+         tl.col = "black", 
+         tl.cex = 0.5,
+         addCoef.col = 'black',
+         addCoefasPercent = T,
+         number.cex = 0.25, 
+         number.digits = 1,
+         bg = "white",     
+         col = NULL)
+```
+
+# Descriptive Data/FAQs
+
+1.  Average % of schools districts close in the average year?
+
+    ```{r sd1_pct_closed}
+    plot <- closure_dist |>  
+      filter(!is.na(recent_locale_simp)) |> 
+      mutate(pct_closed = num_closed/num_schools) |> 
+      group_by(recent_locale_simp) |> 
+      mutate(avg_pct_closed_locale = mean(pct_closed, na.rm = T),
+             sd_pct_closed_locale = sd(pct_closed, na.rm = T)) |> 
+      ungroup() |> 
+      group_by(year, recent_locale_simp) |> 
+      summarize(avg_pct_closed = mean(pct_closed, na.rm = T), 
+                sd_pct_closed = sd(pct_closed, na.rm = T),
+                .groups = 'drop') |> 
+      mutate(avg_saved = avg_pct_closed, 
+             pct_closed_1sd_above = avg_pct_closed + sd_pct_closed) |>
+      select(-sd_pct_closed) |> 
+      pivot_longer(cols = contains("pct_closed"), 
+                   names_to = 'stat',
+                   values_to = 'value') |> 
+      mutate(stat = if_else(stat == 'avg_pct_closed', 
+                            "Average", 
+                            "One Standard Deviation")) |> 
+      ggplot(aes(x = year,
+                 y = value, 
+                 color = stat)) + 
+      geom_point() + 
+      geom_line() +
+      # geom_smooth(method = 'lm',se = F) +
+      facet_grid(~recent_locale_simp) +
+      scale_y_continuous(labels = scales::label_percent()) +
+      scale_color_manual(values = c('lightgreen', "darkgreen")) + # c(pals::cols25(n = 2))) +
+      theme_light() +
+      theme_minimal() +
+      theme(legend.position = 'top',
+            plot.title = element_text(face = 'bold', 
+                                      size = ,
+                                      family = 'serif'),
+            axis.title.y = element_blank(),
+            #axis.line = element_line(color = "black"),
+            axis.text = element_text(face = 'bold'),
+            #panel.grid.major = element_line(color = "grey85"), 
+            #panel.grid.minor = element_line(color = "grey85"),
+            strip.background = element_rect(color = 'lightgray'),
+            strip.text = element_text(face = 'bold',
+                                      family = 'serif'),
+            #plot.background  = element_rect_round(fill = "white", 
+            #                                      color = 'lightgray', # "#FFF9EE",
+            #                                      radius = 0.05),
+            plot.caption = element_text(size = 6, hjust = 0)) +
+      labs(x = 'Year',
+           y = 'Percent Closed',
+           color = '',
+           title = 'Percentage of Schools Closed per Year, by Locale'
+           #subtitle = 'Both average percent and one standard deviation shown.',
+           #caption = 'Note: Districts with no reliable locale data not included.'
+           )
+
+    ggsave("../Visuals/pct_closed-per-year-by_locale2.png", plot = plot,
+           width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+    plot 
+    ```
+
+2.  Number of mass closure events?
+
+    ```{r num_extr_closures}
+    closure_dist |> 
+      mutate(pct_closed = num_closed/num_schools, 
+             extr_close = if_else(pct_closed >= 0.10, 1, 0)) |> 
+      group_by(year, recent_locale_simp) |> 
+      summarize(num_extr_clse = sum(extr_close), 
+                .groups = 'drop') |> 
+      filter(!is.na(recent_locale_simp)) |> 
+      ggplot(aes(x = year, 
+                 y = num_extr_clse)) + 
+      geom_point() + 
+      geom_line() +
+      geom_smooth() + 
+      facet_grid(~recent_locale_simp)
+    ```
+
+## Data Visual Explorations
+
+```{r median_enrollment}
+plot <- closure_dist |> 
+  filter(!is.na(recent_locale_simp)) |>
+  # filter(dist_tot_students <= 60000) |> 
+  group_by(year) |> 
+  summarize(avg_enroll = median(dist_tot_students, na.rm = T), 
+            sd_enroll = sd(dist_tot_students, na.rm = T),
+            .groups = 'drop') |> 
+  # mutate(enroll_half_sd_above = avg_enroll + sd_enroll) |> 
+  select(-sd_enroll) |> 
+  # pivot_longer(cols = contains('enroll'),
+  #              names_to = 'stat',
+  #              values_to = 'value') |> 
+  ggplot(aes(x = year, 
+             y = avg_enroll)) +
+  # facet_grid(~stat, scales = 'free_y') + 
+  # geom_line() +
+  geom_point() + 
+  geom_smooth(method = 'lm', 
+              color = 'darkgreen') +
+  theme_minimal() +
+  theme(legend.position = 'top',
+        plot.title = element_text(face = 'bold', 
+                                  size = 15),
+        plot.subtitle = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_blank()) +
+  #scale_x_continuous(n.breaks = 18) +
+  labs(color = 'Locale',
+       x = 'Year',
+       subtitle = "Median Number of Students Enrolled in Districts, 2000-2018", 
+       title = 'From 2000-2018, the Median District Enrolled Over 150 Fewer Students'
+       # caption = 'District enrollment measured as number of total students enrolled.'
+       )
+
+ggsave("../Visuals/median_enrollment_trend2.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r variation_attempts}
+# closure_dist |> 
+#   filter(!is.na(recent_locale_simp)) |> 
+#   ggplot(aes(x = year, 
+#              y = dist_tot_students, 
+#              color = recent_locale_simp)) + 
+#   geom_point(alpha = 0.25) +
+#   geom_smooth() +
+#   theme_minimal() +
+#   theme(legend.position = 'bottom')
+
+# closure_dist |> 
+#   filter(!is.na(recent_locale_simp)) |> 
+#   filter(dist_tot_students < 1e5) |> 
+#   ggplot(aes(x = year, 
+#              y = dist_tot_students, 
+#              color = recent_locale_simp)) + 
+#   geom_point(alpha = 0.25) +
+#   geom_line(aes(group = agency_id),
+#             alpha = 0.1) + 
+#   geom_smooth(method = 'lm') +
+#   theme_minimal() +
+#   theme(legend.position = 'bottom')
+
+closure_dist |> 
+  filter(!is.na(recent_locale_simp)) |> 
+  filter(dist_tot_students < 1e5) |> 
+  ggplot(aes(x = year, 
+             y = dist_tot_students, 
+             color = recent_locale_simp)) + 
+  # geom_point(alpha = 0.25) +
+  # geom_line(aes(group = agency_id),
+  #           alpha = 0.1) + 
+  geom_smooth() +
+  theme_minimal() +
+  theme(legend.position = 'bottom')
+```
+
+```{r map}
+library(maps)
+
+# --- Step 1: Create mapping between abbreviations and full names ---
+state_mapping <- data.frame(
+  state_abbr = state.abb,
+  state_name_full = tolower(state.name), # Get full names and convert to lowercase
+  stringsAsFactors = FALSE
+)
+
+# --- Step 2: Prepare data ---
+your_data <- closure_dist |> 
+  group_by(dist_state_abbr) |> 
+  summarize(n = sum(extreme_closure_10pct_over_5yr, na.rm = T)/5, 
+            .groups = 'drop') |> 
+  rename(state_abbr = dist_state_abbr)
+
+# --- Step 3: Add full lowercase state names to data ---
+# Merge data with the mapping table
+your_data_with_names <- left_join(your_data, state_mapping, 
+                                  by = "state_abbr") |> 
+  na.omit()
+
+
+# --- Step 4: Get US state map data ---
+us_states_map <- map_data("state")
+
+# --- Step 5: Join your data with the map data ---
+map_data_with_counts <- left_join(us_states_map, your_data_with_names, 
+                                  by = c("region" = "state_name_full")) 
+
+
+# --- Step 6: Create the map plot (same as before) ---
+plot <- ggplot(map_data_with_counts, 
+       aes(x = long, 
+           y = lat, 
+           group = group, 
+           fill = n)) +
+  geom_polygon(color = "black") + # Add white borders to states
+  # scale_fill_viridis_c(option = "C", 
+  #                      name = "Count (n)", 
+  #                      na.value = "grey80") + # Use viridis, set color for NA states
+  scale_fill_gradient(low = "lightgreen", 
+                      high = "darkgreen", 
+                      name = "Count", 
+                      na.value = "grey80") +
+  coord_map("albers", lat0 = 39, lat1 = 45) + # Use Albers projection for US maps
+  labs(title = "Number of Mass School Closures in Each U.S. State, 2000-2018",
+       subtitle = 'Mass closures defined as a district closing 10% or more of their schools over 5 years.',
+       x = "", # Hide axis labels
+       y = "") +
+  theme_minimal() + # Use a minimal theme
+  theme(axis.text = element_blank(), # Hide axis text
+        axis.ticks = element_blank(), # Hide axis ticks
+        panel.grid = element_blank()) # Hide grid lines)
+
+# rm(your_data, state_mapping, your_data_with_names, us_states_map, 
+#    map_data_with_counts)
+
+ggsave("../Visuals/mass_map.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r}
+closure_dist |>  
+  filter(!is.na(recent_type)) |> 
+  filter(str_detect(recent_type, "1") | 
+           str_detect(recent_type, "2") |
+           str_detect(recent_type, "7")) |> 
+  mutate(pct_closed = num_closed/num_schools) |> 
+  group_by(recent_type) |> 
+  mutate(avg_pct_closed_locale = mean(pct_closed, na.rm = T),
+         sd_pct_closed_locale = sd(pct_closed, na.rm = T)) |> 
+  ungroup() |> 
+  group_by(year, recent_type) |> 
+  summarize(avg_pct_closed = mean(pct_closed, na.rm = T), 
+            sd_pct_closed = sd(pct_closed, na.rm = T),
+            .groups = 'drop') |> 
+  mutate(avg_saved = avg_pct_closed, 
+         pct_closed_1sd_above = avg_pct_closed + sd_pct_closed) |>
+  select(-sd_pct_closed) |> 
+  pivot_longer(cols = contains("pct_closed"), 
+               names_to = 'stat',
+               values_to = 'value') |> 
+  mutate(stat = if_else(stat == 'avg_pct_closed', 
+                        "Average", 
+                        "One Standard Deviation")) |> 
+  ggplot(aes(x = year,
+             y = value, 
+             color = stat)) + 
+  geom_point() + 
+  geom_line() +
+  # geom_smooth(method = 'lm',se = F) +
+  facet_grid(~recent_type,
+             labeller = labeller(recent_type = label_wrap_gen(width = 30))) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  scale_color_manual(values = c('lightgreen', "darkgreen")) + # c(pals::cols25(n = 2))) +
+  theme_light() +
+  theme_minimal() +
+  theme(legend.position = 'top',
+        plot.title = element_text(face = 'bold', 
+                                  size = ,
+                                  family = 'serif'),
+        axis.title.y = element_blank(),
+        #axis.line = element_line(color = "black"),
+        axis.text = element_text(face = 'bold'),
+        #panel.grid.major = element_line(color = "grey85"), 
+        #panel.grid.minor = element_line(color = "grey85"),
+        strip.background = element_rect(color = 'lightgray'),
+        strip.text = element_text(face = 'bold',
+                                  size = 12,
+                                  family = 'serif'),
+        #plot.background  = element_rect_round(fill = "white", 
+        #                                      color = 'lightgray', # "#FFF9EE",
+        #                                      radius = 0.05),
+        plot.caption = element_text(size = 6, hjust = 0)) +
+  labs(x = 'Year',
+       y = 'Percent Closed',
+       color = '',
+       title = 'Percentage of Schools Closed per Year, by Type'
+       #subtitle = 'Both average percent and one standard deviation shown.',
+       #caption = 'Note: Districts with no reliable locale data not included.'
+       )
+```
+
+# Table 1
+
+```{r table1_means}
+for_table1 <- closure_dist |> 
+  select(-c(year, 
+            num_closed, # for output table,
+            num_opened,
+            contains('theil'),
+            num_charter, # could be confusion if not charter districts
+            starts_with('avg_schl_tot'), 
+            starts_with('avg_schl_pct'), 
+            ends_with('_yr_enroll_change'), # for output table
+            ends_with('over_1yr'),
+            ends_with('over_3yr'),
+            ends_with('over_5yr'),
+            ends_with('past_1yr'),
+            ends_with('past_3yr'),
+            ends_with('past_5yr'),
+            contains("schl_st_ratio")
+            ))  
+
+# Calculate all summary statistics 
+table1_means <- for_table1 |>
+  summarize(across(where(is.numeric), 
+                   list(mean = ~mean(.x, na.rm = TRUE),
+                        sd = ~sd(.x, na.rm = TRUE),
+                        min = ~min(.x, na.rm = TRUE),
+                        median = ~median(.x, na.rm = TRUE),
+                        max = ~max(.x, na.rm = TRUE)))) |>
+  pivot_longer(cols = everything(),
+               names_to = c("variable", "statistic"),
+               names_pattern = "^(.*)_(mean|sd|median|min|max)$",
+               values_to = "value") |>
+  pivot_wider(names_from = statistic, 
+              values_from = value)
+
+table1_means |> 
+  sjPlot::tab_df()
+```
+
+```{r table1_counts}
+categorical_vars <- closure_dist |>
+select(where(~ is.factor(.) | is.character(.)),
+       -c(agency_id, 
+          dist_state_name, # redundant with state abbreviations
+          dist_state_abbr, # unneeded
+          location_type, # redundant with recent_type_simp
+          recent_locale)) |> # simplier version included
+names()
+  
+ids <- closure_dist$agency_id |> unique()
+
+table1_counts <- lapply(categorical_vars, function(var) {
+  closure_dist |> 
+    filter(!is.na(.data[[var]])) |> 
+    # filter(id %in% ids) |> 
+    group_by(.data[[var]], year) |> 
+    summarise(Count = n(), .groups = 'drop') |> 
+    group_by(.data[[var]]) |> 
+    summarise(Count_yrly_avg = mean(Count, na.rm = T)) |> 
+    mutate(Percentage = round((Count_yrly_avg / sum(Count_yrly_avg)) * 100, 1)) |> 
+    rename(Category = .data[[var]]) |> 
+    mutate(Variable = var) |> 
+    select(Variable, Category, Count_yrly_avg, Percentage)
+  }) |> 
+  bind_rows() 
+
+table1_counts |> 
+  arrange(Variable, desc(Percentage)) |> 
+  select(-Variable, -Count_yrly_avg) |> 
+  rename(Variable = Category) |> 
+  sjPlot::tab_df()
+```
+
+```{r def_format_value}
+# Vectorized helper function to format values based on variable type
+format_value <- function(value, variable) {
+  dplyr::case_when(
+    str_detect(variable, "pct") ~ paste0(100 * round(value, 2), "%"),
+    str_detect(variable, "_expend") ~ paste0("$", round(value, 2)),
+    TRUE ~ as.character(round(value, 2))
+  )
+}
+```
+
+```{r create_table1}
+table1 <- table1_means |> 
+  mutate(
+    mean_pct = paste0(format_value(mean, variable), 
+                      " (", format_value(sd, variable), ")"),
+    mean_pct = if_else(str_detect(variable, "_expend"), 
+                       sub("^(.*?\\$.*?)\\$", "\\1", mean_pct), 
+                       mean_pct),
+    median_label = as.character(format_value(median, variable)),
+    min_label = as.character(format_value(min, variable)),
+    max_label = as.character(format_value(max, variable))
+  ) |> 
+  select(-c(sd, median, min, max)) |> 
+  rename(Variable = variable, 
+         for_order = mean) |> 
+  bind_rows(table1_counts |> 
+              arrange(Variable, desc(Percentage)) |> 
+              select(-Variable, -Count_yrly_avg) |> 
+              mutate(for_order = Percentage) |> 
+              rename(Variable = Category,
+                     mean_pct = Percentage) |> 
+              mutate(mean_pct = as.character(round(mean_pct, 2)), 
+                     mean_pct = paste0(mean_pct, "%"))) |> 
+  select(Variable, for_order, mean_pct, 
+         min_label, median_label, max_label)
+
+
+# Rename and re-arrange variables to be readable
+table1 <- table1 |> 
+  filter(!(str_detect(Variable, "avg_schl_pct_") & 
+             !str_detect(Variable, "avg_schl_pct_dist_enroll"))) |> 
+  mutate(Category = c(
+    "1 - Count 1",
+    "1 - Count 9",
+    "1 - Count 3",
+    "1 - Count 4",
+    "1 - Count 5",
+    "1 - Count 6",
+    "1 - Count 7",
+    "1 - Count 8",
+    # "5 - Other", 
+    "1 - Count 2",
+    "5 - Other",
+    "5 - Other",
+    "2 - Demographic 1",
+    "2 - Demographic 1",
+    "2 - Demographic 1",
+    "2 - Demographic 1",
+    "2 - Demographic 2",
+    "2 - Demographic 1",
+    # "1 - Count 91",
+    "3 - Locale",
+    "3 - Locale",
+    "3 - Locale",
+    "3 - Locale",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type",
+    "4 - Agency Type"
+  ),
+  .before = Variable) |>
+  arrange(Category, desc(for_order)) |> 
+  mutate(Variable = case_when(
+    Variable == 'num_schools' ~ "Number of Schools",
+    Variable == 'num_schl_more_diverse' ~ "Schools More Diverse Than the District",
+    Variable == 'num_level_elem' ~ "Elementary Schools",
+    Variable == 'num_level_midd' ~ "Middle Schools",
+    Variable == 'num_level_high' ~ "High Schools",
+    Variable == 'num_level_other' ~ "Schools of Other Levels",
+    Variable == 'num_magnet' ~ "Magnet Schools",
+    Variable == 'num_title1' ~ "Title 1 Schools",
+    Variable == 'avg_schl_pct_dist_enroll' ~ "Average Percent of District Enrollment in a School",
+    Variable == 'dist_tot_students' ~ "Total Number of Students",
+    Variable == 'dist_per_pupil_expend' ~ "Per-Pupil Expenditure",
+    Variable == 'dist_st_ratio' ~ "Student:Teacher Ratio",
+    Variable == 'dist_pct_blk' ~ "Percent Black",
+    Variable == 'dist_pct_wht' ~ "Percent White",
+    Variable == 'dist_pct_hsp' ~ "Percent Hispanic",
+    Variable == 'dist_pct_asi' ~ "Percent Asian",
+    Variable == 'dist_pct_frpl' ~ "Percent Free-and-Reduced Lunch",
+    Variable == 'dist_pct_oth' ~ "Percent 'Other'",
+    Variable == 'num_opened' ~ "Number of Schools Opened",
+    # District locales and types left as is (remaining rows)
+    .default = Variable)) |> 
+    select(-c(for_order, Category))
+```
+
+```{r add_prevalence}
+table1 <- bind_rows(
+  tibble(Variable = 'Mass Closure Prevalence', 
+         mean_pct = paste0(
+           as.character(round(
+             mean(closure_dist$extreme_closure_10pct_over_5yr,
+                  na.rm = T), 3)*100),
+           "% (", 
+           as.character(round(
+             sd(closure_dist$extreme_closure_10pct_over_5yr,
+                na.rm = T), 2)*100),
+           "%)"),
+         min_label = NA,
+         median_label = NA,
+         max_label = NA),
+  table1
+)
+
+table1
+```
+
+```{r save_table1}
+write_csv(table1, "../Data/table1.csv")
+rm(table1_counts, table1_means, for_table1,
+   categorical_vars, ids)
+```

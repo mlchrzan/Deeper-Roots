@@ -1,0 +1,383 @@
+---
+title: "Model Prep"
+format: pdf
+editor: visual
+---
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+```
+
+```{r setup_data}
+# Take only the rows with the desired outcome
+data_5yr_base <- closure_dist %>%
+  # Remove other outcomes and unncessary/duplicate variables
+  select(-c(recent_locale, # simplified version is in the data
+            location_type, dist_state_name, 
+            starts_with("num_closed_over_"), 
+            starts_with("will_close_over"), 
+            starts_with("num_opened_past_"))) |> 
+  # Get only years with the desired outcome
+  filter(!is.na(extreme_closure_10pct_over_5yr)) %>%
+  # Adjust type for caret package
+  mutate(across(starts_with("extreme_closure_10pct"), ~{
+    f <- as.factor(.)
+    levels(f) <- make.names(levels(f))
+    f
+  })) |> 
+  select(extreme_closure_10pct_over_5yr, agency_id, year, everything())
+
+
+# Remove HI and District Types with too few observations (near 0)
+data_5yr_base <- data_5yr_base |> 
+  filter(dist_state_abbr != 'HI') |> 
+  filter(str_detect(recent_type, '1') |
+           str_detect(recent_type, '2') | 
+           str_detect(recent_type, '7') |
+           is.na(recent_type))
+
+data_5yr_base
+```
+
+```{r remove_missing}
+# Listwise deletion
+data_5yr_base_omit <- data_5yr_base |> na.omit()
+```
+
+```{r export_data_for_sherlock}
+write_csv(data_5yr_base, "../Data/data_5yr_base_FULL.csv")
+write_csv(data_5yr_base_omit, "../Data/data_5yr_base_omit_FULL.csv")
+```
+
+# Functions
+
+```{r def_stratified_group_kfold}
+# Function to create stratified group folds
+stratified_group_kfold <- function(data, group_col, 
+                                   strata_col, k = 5, seed = 42) {
+  set.seed(seed)
+  
+  # Get unique groups and their strata
+  group_strata <- data %>%
+    select(!!sym(group_col), !!sym(strata_col)) %>%
+    distinct()
+  
+  # Count occurrences of each stratum
+  strata_counts <- table(group_strata[[strata_col]])
+  
+  # Create empty list to store fold assignments
+  folds <- list()
+  for (i in 1:k) {
+    folds[[i]] <- character(0)
+  }
+  
+  # For each stratum, distribute groups across folds
+  for (stratum in names(strata_counts)) {
+    # Get groups for this stratum
+    stratum_groups <- group_strata %>%
+      filter(!!sym(strata_col) == stratum) %>%
+      pull(!!sym(group_col))
+    
+    # Shuffle the groups
+    stratum_groups <- sample(stratum_groups)
+    
+    # Distribute groups to folds
+    for (i in 1:length(stratum_groups)) {
+      fold_idx <- i %% k
+      if (fold_idx == 0) fold_idx <- k
+      folds[[fold_idx]] <- c(folds[[fold_idx]], stratum_groups[i])
+    }
+  }
+  
+  # Create a mapping from group to fold
+  group_to_fold <- data.frame(
+    group = unlist(folds),
+    fold = rep(1:k, sapply(folds, length))
+  )
+  
+  # Join with original data
+  result <- data %>%
+    left_join(group_to_fold, by = setNames("group", group_col))
+  
+  return(result$fold)
+}
+```
+
+```{r def_create_train_indices}
+# Function to convert folds to caret's expected training indices format
+create_train_indices <- function(folds, k) {
+  train_indices <- list()
+  
+  for (i in 1:k) {
+    # Get indices for all samples EXCEPT those in fold i
+    train_indices[[i]] <- which(folds != i)
+  }
+  
+  return(train_indices)
+}
+
+# Debuggine example:
+# Create fold indices
+fold_indices <- stratified_group_kfold(
+  data = data_5yr_base_omit,
+  group_col = "agency_id",  # The grouping variable (districts)
+  strata_col = "recent_type",      # The stratification variable
+  k = 5                       # Number of folds
+)
+
+# Convert to caret's expected format (training indices)
+train_indices <- create_train_indices(fold_indices, k = 5)
+rm(fold_indices, train_indices)
+```
+
+```{r def_split_data}
+# For debugging
+dataset <- data_5yr_base
+
+split_data <- function(seed, dataset, 
+                       omit_na = F,
+                       standardize = F) {
+  
+  set.seed(seed)
+  
+  if(omit_na) {
+    dataset <- dataset |> na.omit()
+  }
+  
+  # Split while ensuring all years of the same district in same set
+  unique_dists <- unique(dataset$agency_id)
+  train_schools <- sample(unique_dists, 
+                          size = floor(0.8 * length(unique_dists)))
+  
+  train <- dataset |> filter(agency_id %in% train_schools)
+  test <- dataset |> filter(!(agency_id %in% train_schools))
+  
+  # Generate folds for CV to prevent data leakage
+  # folds <- groupKFold(train$agency_id, k = 5)
+  fold_indices <- stratified_group_kfold(
+    data = train,
+    group_col = "agency_id",  # The grouping variable (districts)
+    strata_col = "dist_state_abbr",      # The stratification variable
+    k = 5                       # Number of folds
+  )
+  
+  # Convert to caret's expected format (training indices)
+  folds <- create_train_indices(fold_indices, k = 5)
+  
+  # Save original train and test
+  train_origin <- train
+  test_origin <- test
+  
+  # Remove identifier variable
+  train <- dplyr::select(train, -agency_id) 
+  test <- dplyr::select(test, -agency_id) 
+  
+  if(standardize){
+    # Save training set mean and sd to use for standardizing test set
+    std_info <- train |> 
+      summarize(across(where(is.numeric), ~mean(., na.rm = T), .names = "mean_{.col}"),
+                across(where(is.numeric), ~sd(., na.rm = T), .names = "sd_{.col}"))
+    
+    # Standardize
+    train <- train |> 
+      mutate(across(where(is.numeric), scale),
+             across(where(is.numeric), as.vector))
+    
+    test <- test |>
+      mutate(across(where(is.numeric), 
+                    ~ (.x - std_info[[paste0("mean_", cur_column())]]) /
+                      std_info[[paste0("sd_", cur_column())]])) |>
+      mutate(across(where(is.numeric), as.vector))
+    
+    return(list(train_original = train_origin, 
+                test_original = test_origin,
+                train_std = train,
+                test_std = test,
+                std_info = std_info,
+                CV_folds = folds))
+  }
+  
+  return(list(train_original = train_origin, 
+              test_original = test_origin,
+              train = train,
+              test = test,
+              CV_folds = folds))
+}
+```
+
+```{r def_calculate_imv}
+# Helper
+ll <- function(x , p) {
+    z <- log(p) * x + log(1 - p) * (1 - x)
+    z <- sum(z) / length(z)
+    exp(z)
+}
+  
+# Helper
+get_w <- function(a) {
+    f <- function(p, a) abs(p * log(p) + (1 - p) * log(1 - p) - log(a))
+    nlminb(.5, f, lower = 0.001, upper = .999, a = a)$par
+}
+
+calculate_imv <- function(y_basic, y_enhanced, y) {
+  ll_basic <- ll(y, y_basic)
+  ll_enhanced <- ll(y, y_enhanced)
+  w0 <- get_w(ll_basic)
+  w1 <- get_w(ll_enhanced)
+  return((w1 - w0) / w0)
+}
+```
+
+```{r FUNC_imv_cv}
+imv_cv <- function(y, y_basic, y_enhanced, folds){
+  
+  imv_fold_metrics = tibble()
+  fold_count = 0
+  for (fold in folds){
+    fold_count = fold_count + 1
+    
+    y_fold <- y[fold] 
+    y_basic_fold <- y_basic[fold]
+    y_enhanced_fold <- y_enhanced[fold]
+  
+    fold_imv <- calculate_imv(y = y_fold, 
+                              y_basic = y_basic_fold, 
+                              y_enhanced = y_enhanced_fold)
+    
+    imv_fold_metrics <- bind_rows(imv_fold_metrics, 
+                                  tibble(Fold = fold_count, 
+                                         IMV = fold_imv))
+  }
+  
+  return(imv_fold_metrics)
+}
+```
+
+# Prep for Omitted Data
+
+```{r split_data}
+set.seed(1234)
+data_5yr_base_omit_splits <- split_data(seed = "1234", data_5yr_base_omit, 
+                                        omit_na = F, standardize = F)
+
+data_5yr_base_omit_splits
+```
+
+```{r pull_from_splits}
+train <- data_5yr_base_omit_splits$train
+test <- data_5yr_base_omit_splits$test
+folds <- data_5yr_base_omit_splits$CV_folds
+```
+
+## Sanity Checks
+
+```{r check_split}
+intersect(data_5yr_base_omit_splits$train_original$agency_id, 
+          data_5yr_base_omit_splits$test_original$agency_id)
+```
+
+```{r check_folds}
+data_fold2_check <- data_5yr_base_omit_splits$train_original
+
+fold_indices <- stratified_group_kfold(
+  data = data_fold2_check,
+  group_col = "agency_id",  # The grouping variable (districts)
+  strata_col = "dist_state_abbr",      # The stratification variable
+  k = 5                       # Number of folds
+)
+
+# Convert to caret's expected format (training indices)
+train_indices <- create_train_indices(fold_indices, k = 5)
+
+# Loop through each fold and create a binary indicator column for each
+for(i in seq_along(train_indices)) {
+  # Create a vector of zeros of length equal to the number of rows in df
+  indicator <- rep(0, nrow(data_fold2_check))
+  # Set to 1 for rows in the current fold
+  indicator[train_indices[[i]]] <- 1
+  # Attach the column to df; names "Fold1", "Fold2", etc.
+  data_fold2_check[[paste0("Fold", i)]] <- indicator
+}
+
+data_fold2_check <- data_fold2_check |> 
+  pivot_longer(cols = starts_with('Fold'), 
+               names_to = 'resample', 
+               values_to = 'in_fold') |> 
+  filter(in_fold == 0) |> 
+  select(-in_fold) 
+
+data_fold2_check |> 
+  group_by(resample, dist_state_abbr) |> 
+  summarize(n = n(), 
+            .groups = 'drop') |> 
+  ggplot(aes(y = resample, 
+             fill = resample,
+             x = n)) + 
+  geom_col(position = 'dodge') + 
+  facet_wrap(~dist_state_abbr, scales = 'free')
+
+data_fold2_check |> 
+  group_by(resample, recent_type) |> 
+  summarize(n = n(), 
+            .groups = 'drop') |> 
+  ggplot(aes(y = resample, 
+             fill = resample,
+             x = n)) + 
+  geom_col(position = 'dodge') + 
+  facet_wrap(~recent_type, scales = 'free')
+
+data_fold2_check |> 
+  group_by(resample, recent_locale_simp) |> 
+  summarize(n = n(), 
+            .groups = 'drop') |> 
+  ggplot(aes(x = resample, 
+             y = n,
+             fill = recent_locale_simp)) + 
+  geom_col(position = 'dodge')
+
+data_fold2_check |> 
+  group_by(resample, extreme_closure_10pct_over_5yr) |> 
+  summarize(n = n(), 
+            .groups = 'drop') |> 
+  ggplot(aes(x = resample, 
+             y = n,
+             fill = extreme_closure_10pct_over_5yr)) + 
+  geom_col(position = 'dodge')
+
+rm(data_fold2_check, fold_indices, train_indices, indicator)
+```
+
+```{r export_split_data}
+# Save training data from omitted dataset
+data_5yr_base_omit_splits$train_original |> 
+  write_csv(file = "../Data/data_5yr_base_omit_TRAIN.csv")
+
+# For LSTM (changed outcome to numeric)
+data_5yr_base_omit_splits$train_original |> 
+  mutate(extreme_closure_10pct_over_5yr = 
+           if_else(extreme_closure_10pct_over_5yr == 'X1', 1, 0)) |> 
+  write_csv(file = "../Data/data_5yr_base_omit_TRAIN_LSTM.csv")
+
+
+saveRDS(folds, file = "../Data/folds.rds")
+
+# For LSTM training, convert the folds list to a dataframe before saving
+folds_df <- data.frame(matrix(0, 
+                              nrow = nrow(data_5yr_base_omit_splits$train_original), 
+                              ncol = 5))
+names(folds_df) <- paste0("Fold", 1:5)
+
+# For each fold, set the value to 1 for rows that are in the training set
+for(i in 1:5) {
+  folds_df[folds[[i]], i] <- 1
+}
+
+folds_df <- folds_df |> 
+  mutate(agency_id = data_5yr_base_omit_splits$train_original$agency_id,
+         .before = Fold1)
+
+# Save as CSV (more portable)
+write.csv(folds_df, "../Data/folds_LSTM.csv", row.names = FALSE)
+
+rm(i)
+```

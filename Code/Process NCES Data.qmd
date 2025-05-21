@@ -1,0 +1,366 @@
+---
+title: "Process NCES Data"
+format: pdf
+editor: visual
+---
+
+# Setup
+
+```{r def_Mode}
+# Create Mode function to find the most common value that is not NA
+Mode <- function(x, na.rm = FALSE) {
+  if(na.rm){
+    x = x[!is.na(x)]
+  }
+
+  ux <- unique(x)
+  return(ux[which.max(tabulate(match(x, ux)))])
+}
+```
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(janitor) #for clean_names()
+library(DescTools) # for Winsorize()
+library(doParallel) # for parallel processing
+```
+
+```{r import-data, message=FALSE, warning=FALSE}
+closure <- read_csv("../Data/NCES/school_district_theil_index.csv",
+                    show_col_types = F)
+
+district_states <- read_csv("../Data/NCES/district_state_info.csv", skip = 6,
+                            show_col_types = F)
+
+district_states <- clean_names(district_states)
+
+dist_openings <- read_csv("../Data/NCES/dist_openings_2000_2019.csv",
+                          show_col_types = F) # used after aggregation
+
+district_states <- district_states |> 
+  rename(agency_id = starts_with("agency_id"), 
+         dist_state_name = starts_with('state_name'),
+         dist_state_abbr = starts_with('state_abbr')) |> 
+  mutate(agency_id = as.numeric(agency_id), 
+         dist_state_abbr = as.factor(dist_state_abbr), 
+         dist_state_name = as.factor(dist_state_name))
+
+closure <- left_join(closure, 
+                     district_states, 
+                     by = join_by(agency_id))
+rm(district_states)
+
+# Rearrange
+closure <- closure |> 
+  dplyr::select(agency_id, 
+                school_id, 
+                year, 
+                school_name, 
+                dist_state_name, 
+                dist_state_abbr, 
+                everything())
+```
+
+```{r clean_data}
+closure <- closure |> 
+  mutate(school_level = if_else(school_level == 5 | school_level == 6, 
+                                4, school_level)) 
+
+# Recreate location type from dummy variables, including NA's where appropriate
+location_known <- closure |> 
+  pivot_longer(cols = c(urban, suburban, rural), 
+               names_to = "location_type") |> 
+  mutate(location_type = if_else(value == 0, NA, location_type)) |>
+  filter(value == 1) |>
+  dplyr::select(-value)
+  
+rows_without_location <- closure |> 
+  pivot_longer(cols = c(urban, suburban, rural), 
+               names_to = "location_type") |> 
+  mutate(location_type = if_else(value == 0, NA, location_type)) |>
+  distinct() |> 
+  filter(value == 0) |>
+  dplyr::select(-value) 
+
+location_unknown <- anti_join(rows_without_location, location_known, 
+                              by = join_by(school_id, year))
+
+closure <- bind_rows(location_known, location_unknown) 
+
+rm(location_known, location_unknown, rows_without_location)
+
+
+# Remove persisting rows for schools after they close
+closure <- closure |> 
+  # Find year school closed
+  group_by(school_id, year) |> 
+  filter(closed == 1) |> 
+  summarize(year_closed = year, 
+            .groups = 'keep') |> 
+  ungroup() |> 
+  dplyr::select(-year) |> 
+  # Filter to only include years less than or equal to that year for each school
+  right_join(closure, 
+             by = join_by(school_id)) |> 
+  mutate(year_closed = if_else(is.na(year_closed), 
+                               as.numeric(format(Sys.Date(), "%Y")), 
+                               year_closed)) |> 
+  filter(year <= year_closed) |> 
+  dplyr::select(year_closed, agency_id, school_id, 
+                school_name, year, closed, everything()) |> 
+  dplyr::select(-year_closed, -agency_name)
+
+
+# Create factors
+closure <- closure |> 
+  mutate(school_id = factor(school_id, levels = unique(school_id)), 
+         agency_id = factor(agency_id, levels = unique(agency_id)), 
+         #closed = factor(closed, levels = unique(closed)),
+         school_level = factor(school_level, levels = unique(school_level)), 
+         charter = factor(charter, levels = unique(charter)), 
+         magnet = factor(magnet, levels = unique(magnet)), 
+         title1 = factor(title1, levels = unique(title1)), 
+         location_type = factor(location_type, levels = unique(location_type))) 
+
+
+# Correct Location Types
+closure <- closure |> 
+  group_by(school_id) |> 
+  mutate(most_common_location = Mode(location_type, na.rm = TRUE)) |> 
+  mutate(location_type = most_common_location) |> 
+  ungroup() |> 
+  dplyr::select(-most_common_location)
+
+  
+# Correct Percentages/Ratios
+  # maxval's chosen based on distributions
+closure$st_ratio <- Winsorize(closure$st_ratio, 
+                              val = c(1, 51))
+
+closure$dist_st_ratio <- Winsorize(closure$dist_st_ratio, 
+                                   val = c(1, 33))
+
+  # All percentages higher than 100 capped to 100
+closure <- closure |>  
+  mutate(across((starts_with("dist_pct")), ~if_else(. > 1, 1, .)), 
+         pct_frpl = if_else(pct_frpl > 1, 1, pct_frpl))
+
+
+
+# Fix districts indicating no students enrollled 
+# Done summing the number of students broken down by race (if tot_students is 0 or missing) and then summing up the students in all the schools within a given year for a district
+closure <- closure |> 
+  group_by(agency_id, year) |> 
+  mutate(tot_students = if_else(tot_students == 0 | is.na(tot_students), 
+                                tot_ami + tot_asi + tot_hsp + tot_blk + tot_wht + tot_oth,
+                                tot_students),
+         dist_tot_students = if_else(dist_tot_students < sum(tot_students) | is.na(dist_tot_students), 
+                                     sum(tot_students), 
+                                     dist_tot_students), 
+         # If either is still 0, the district should not be included in analysis
+         tot_students = if_else(tot_students == 0, 
+                                NA, tot_students),
+         dist_tot_students = if_else(dist_tot_students == 0, 
+                                     NA, 
+                                     dist_tot_students)) |> 
+  ungroup() 
+
+
+# Title1 Categories 
+  # These categories changed in 2011 to have more nuance. To align the indicators
+  # across the years, I will adjust all post-2011 values to the former 1-Yes/2-No structure
+closure <- closure |> 
+  mutate(title1 = if_else(title1 == 6, "2-No", title1), # 6 being the "No" indicator post 2011
+         title1 = if_else(!(title1 %in% c("1-Yes", "2-No")) & !is.na(title1), 
+                          "1-Yes", title1))
+```
+
+```{r feature_engineering}
+# What percent of of District Enrollment is at this school? 
+closure <- closure |> 
+  mutate(pct_dist_enroll = tot_students/dist_tot_students)
+
+# Fixing dist_tot_student totals for schools and years where the pct was over 100 (dist count wasn't 0, but was still too low, single digit counts)
+closure <- closure |> 
+  group_by(agency_id, year) |> 
+  mutate(dist_tot_students = if_else(pct_dist_enroll > 100, 
+                                     sum(tot_students), 
+                                     dist_tot_students), 
+         pct_dist_enroll = if_else(pct_dist_enroll > 100, 
+                                   tot_students/dist_tot_students, 
+                                   pct_dist_enroll)) |> 
+  ungroup() 
+
+# Is the school more diverse than the district? 
+closure <- closure |> 
+  mutate(school_more_diverse = if_else(sch_theil < dist_theil, "Yes", "No"))
+```
+
+# Generate District-Level Dataset
+
+```{r sanity_check_row_num}
+# What should the final row count be?
+closure |> 
+  group_by(agency_id, year) |> 
+  summarize(.groups = 'keep') |> 
+  n_distinct()
+```
+
+```{r aggregate}
+closure_dist <- closure |> 
+  mutate(closed = as.numeric(closed)) |>
+  rename_with(~ gsub("^tot_", "avg_schl_tot_", .x), starts_with("tot_")) |> 
+  rename_with(~ gsub("^pct_", "avg_schl_pct_", .x), starts_with("pct_")) 
+
+cl <- makeCluster(detectCores() - 4)
+registerDoParallel(cl)
+
+closure_dist <- closure_dist |> 
+  group_by(agency_id, year) |> 
+  summarize(num_closed = sum(closed, na.rm = T),
+            num_schools = n_distinct(school_id),
+            num_schl_more_diverse = sum(school_more_diverse == 'Yes', 
+                                        na.rm = T),
+            num_level_elem = sum(school_level == 1, na.rm = T), 
+            num_level_midd = sum(school_level == 2, na.rm = T), 
+            num_level_high = sum(school_level == 3, na.rm = T), 
+            num_level_other = sum(school_level == 4, na.rm = T), 
+            num_charter = sum(charter == '1-Yes', na.rm = T), 
+            num_magnet = sum(magnet == '1-Yes', na.rm = T), 
+            num_title1 = sum(title1 == '1-Yes', na.rm = T), 
+            location_type = Mode(location_type),
+            avg_schl_theil = mean(sch_theil, na.rm = T),
+            min_schl_theil = min(sch_theil, na.rm = T),
+            max_schl_theil = max(sch_theil, na.rm = T),
+            sd_schl_theil = sd(sch_theil, na.rm = T),
+            avg_schl_st_ratio = mean(st_ratio, na.rm = T),
+            min_schl_st_ratio = min(st_ratio, na.rm = T),
+            max_schl_st_ratio = max(st_ratio, na.rm = T),
+            sd_schl_st_ratio = sd(st_ratio, na.rm = T),
+            # For all variables that start with 'avg_schl_tot_'
+            across(starts_with('avg_schl_tot_'), list(
+              avg = ~mean(., na.rm = T),
+              min = ~min(., na.rm = T),
+              max = ~max(., na.rm = T),
+              sd = ~sd(., na.rm = T)
+            ), .names = "{.col}_{.fn}"),
+            
+            # For all variables that start with 'avg_schl_pct_'
+            across(starts_with('avg_schl_pct_'), list(
+              avg = ~mean(., na.rm = T),
+              min = ~min(., na.rm = T),
+              max = ~max(., na.rm = T),
+              sd = ~sd(., na.rm = T)
+            ), .names = "{.col}_{.fn}"),
+            across(starts_with('dist_'), ~ first(.)), 
+            .groups = 'keep') |>
+  ungroup() 
+
+stopCluster(cl)
+beepr::beep(1)
+# Sanity check - View the first few rows
+print(head(closure_dist))
+```
+
+```{r cleanAndJoin_additional_data, warning=FALSE}
+library(janitor)
+additional_data <- read_csv("../Data/NCES/additional_NCES_vars.csv",
+                            skip = 6,
+                            show_col_types = F) |> 
+  clean_names()
+
+agency_types <- additional_data |> 
+  rename(agency_id = agency_id_nces_assigned_district_latest_available_year) |> 
+  select(agency_id, agency_name, starts_with('agency_type'),
+         -state_name_district_latest_available_year) |> 
+  pivot_longer(cols = starts_with("agency_type"),
+               names_to = 'year',
+               values_to = 'agency_type') |> 
+  mutate(year = str_remove(year, "agency_type_district_"),
+         year = str_replace(year, "_", "-"))
+
+locales <- additional_data |> 
+  rename(agency_id = agency_id_nces_assigned_district_latest_available_year) |> 
+  select(agency_id, agency_name, starts_with('locale'),
+         -state_name_district_latest_available_year) |> 
+  pivot_longer(cols = starts_with("locale"),
+               names_to = 'year',
+               values_to = 'locale') |> 
+  mutate(year = str_remove(year, "locale_district_"),
+         year = str_replace(year, "_", "-"))
+
+additional_data_long <- left_join(agency_types, locales, 
+                                  by = join_by(agency_id, agency_name, year))
+
+# Get the most recent of each classification
+add_data_recent <- additional_data_long |>
+  mutate(year = str_remove(year, "-.*"),
+         year = as.numeric(year),
+         across(where(is.character), ~na_if(., "†")),
+         across(where(is.character), ~na_if(., "–")),
+         across(where(is.character), ~na_if(., "‡"))) |> 
+  arrange(agency_id, desc(year)) |> 
+  group_by(agency_id) |> 
+  summarize(recent_type = agency_type[!is.na(agency_type)][1],
+            recent_locale = locale[!is.na(locale)][1])
+
+closure_dist <- left_join(closure_dist, add_data_recent,
+                          by = join_by('agency_id')) 
+
+# Simplify new locales and adjust the NaN values from the lags
+closure_dist <- closure_dist |> 
+  mutate(
+    recent_locale_simp = case_when(
+      str_sub(recent_locale, 1, 1) == '1' ~ 'Urban',
+      str_sub(recent_locale, 1, 1) == '2' ~ 'Suburban',
+      str_sub(recent_locale, 1, 1) %in% c('3', "6") ~ 'Town',
+      str_sub(recent_locale, 1, 1) %in% c("4", "7", "8") ~ 'Rural',
+      str_sub(recent_locale, 1, 2) %in% c('2-', "3-", "4-") ~ "Urban"
+    ),
+    across(where(is.numeric), ~ifelse(is.nan(.), NA, .))
+  ) 
+
+rm(agency_types, locales, additional_data_long, 
+   additional_data, add_data_recent)
+```
+
+```{r create_outcome}
+# Number Closed OVER 5 Years from current 
+# ALSO calculating number opened as new predictor variables
+closure_dist <- closure_dist |> 
+  group_by(agency_id) |> 
+  mutate(num_closed_over_5yr = dplyr::lead(num_closed, n = 5) +
+           dplyr::lead(num_closed, n = 4) +
+           dplyr::lead(num_closed, n = 3) + 
+           dplyr::lead(num_closed, n = 2) + 
+           dplyr::lead(num_closed, n = 1)) |> 
+  ungroup()
+
+# Manually creating num_opened from the number of schools
+closure_dist <- closure_dist |> 
+  mutate(num_opened = dplyr::lead(num_schools, n = 1) - num_schools,
+         num_opened = if_else(num_opened < 0 | is.na(num_opened),
+                              0,
+                              num_opened)) |>
+  ungroup()
+
+
+# Percentage of schools closed in current year and over next 5 years AND 
+  # Binary variables of these values are above 10% for a district
+closure_dist <- closure_dist |> 
+  mutate(pct_closed = num_closed/num_schools, 
+         pct_closed_over_5yr = num_closed_over_5yr/num_schools, 
+         #extreme_closure_10pct_over_1yr = if_else(pct_closed_over_1yr > 0.10, 1, 0), 
+         #extreme_closure_10pct_over_3yr = if_else(pct_closed_over_3yr > 0.10, 1, 0), 
+         extreme_closure_10pct_over_5yr = if_else(pct_closed_over_5yr > 0.10, 1, 0)) |> 
+  dplyr::select(-contains('pct_closed'), -num_closed_over_5yr) |> 
+  dplyr::select(agency_id, year, extreme_closure_10pct_over_5yr, everything())
+```
+
+```{r clean_env}
+rm(closure, dist_openings)
+```
+
+```{r view_final_data}
+closure_dist
+```

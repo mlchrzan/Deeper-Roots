@@ -1,0 +1,1500 @@
+---
+title: "Results"
+format: html
+editor: visual
+---
+
+# Setup
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(PRROC)
+```
+
+# Model Performance
+
+```{r best_hyperparams}
+m_enet$bestTune
+m_rf$bestTune
+m_xgb$bestTune
+lstm_perf_data |> filter(avg_pr == max(avg_pr))
+```
+
+```{r}
+data_lstm <- read_csv("../Sherlock/LSTM_grid_search_results_20250429_224939.csv",
+         show_col_types = FALSE)
+
+data_lstm |> 
+  ggplot(aes(x = avg_pr, 
+             y = avg_rec)) + 
+  geom_point(aes(color = as.factor(lstm_units),
+                 shape = as.factor(learning_rate))) + 
+  theme_minimal()
+
+data_lstm |> 
+  filter(avg_pr == max(avg_pr))
+
+data_lstm |> 
+  filter(learning_rate == 0.0001) |> 
+  summarize(sd_pr = sd(avg_pr),
+            sd_rec = sd(avg_rec)) |> 
+  mutate(avg_pr = (data_lstm |> 
+                     filter(learning_rate == 0.0001) |> 
+                     filter(avg_pr == max(avg_pr)))$avg_pr,
+         avg_rec = (data_lstm |> 
+                      filter(learning_rate == 0.0001) |> 
+                      filter(avg_rec == max(avg_rec)))$avg_rec) |> 
+  rename(AUC = avg_pr,
+         AUCSD = sd_pr,
+         Recall = avg_rec,
+         RecallSD = sd_rec) |> 
+  mutate(Model = 'LSTM')
+
+lstm_fold_metrics |>
+    group_by(param_set) |>
+    summarize(AUC = mean(val_pr),
+              AUCSD = sd(val_pr)) |>
+    ungroup() |>
+    filter(AUC == max(AUC)) |>
+    mutate(Model = "LSTM")
+```
+
+```{r model_results}
+results_models <- bind_rows(
+  m_enet$results |> 
+    filter(alpha == m_enet$bestTune$alpha, 
+           lambda == m_enet$bestTune$lambda) |> 
+    mutate(Model = 'Elastic Net'),
+  
+  m_rf$results |> 
+    filter(mtry == m_rf$bestTune$mtry, 
+           splitrule == m_rf$bestTune$splitrule, 
+           min.node.size == m_rf$bestTune$min.node.size) |> 
+    mutate(Model = "Random Forest"),
+  
+  left_join(m_xgb$bestTune, 
+            m_xgb$results, 
+            by = join_by(nrounds, max_depth, eta, 
+                         gamma, colsample_bytree, 
+                         min_child_weight, subsample)) |> 
+    mutate(Model = "XGBoost"), 
+  
+  bind_cols(
+    data_lstm |> 
+      filter(learning_rate == 0.0001) |> 
+      summarize(sd_rec = sd(avg_rec)) |> 
+      mutate(avg_rec = (data_lstm |> 
+                          filter(learning_rate == 0.0001) |> 
+                          filter(avg_rec == max(avg_rec)))$avg_rec) |> 
+      rename(Recall = avg_rec,
+             RecallSD = sd_rec),
+    
+    lstm_fold_metrics |>
+      group_by(param_set) |>
+      summarize(AUC = mean(val_pr),
+                AUCSD = sd(val_pr)) |>
+      ungroup() |>
+      filter(AUC == max(AUC)) |>
+      mutate(Model = "LSTM")
+  )
+) |> 
+  select(Model, AUC, AUCSD, Recall, RecallSD) |> 
+  arrange(Model)
+
+get_SL_model_eval <- readRDS("../Sherlock/m_SLCV_evals.rds")
+# SL_model_eval <- get_SLevals_by_fold(m_SL) |> 
+SL_model_eval <- get_SL_model_eval |> 
+  select(mean_prauc, sd_prauc, mean_recall, sd_recall) |>
+  distinct() |>
+  mutate(Model = 'SuperLearner') |>
+  rename(AUC = mean_prauc,
+         AUCSD = sd_prauc,
+         Recall = mean_recall,
+         RecallSD = sd_recall)
+
+results_models <- bind_rows(results_models,
+                            SL_model_eval) |>
+  arrange(Model)
+
+results_models
+```
+
+```{r model_accuracy, warning=FALSE}
+confusion_enet <- caret::confusionMatrix(
+  predictions_train_enet_yearFE,
+  as.factor(ifelse(Y == 1, "X1", "X0")),
+  positive = 'X1')
+
+confusion_SL <- caret::confusionMatrix(
+  as.factor(ifelse(m_SL$SL.predict < 0.5, 0, 1)),
+  as.factor(Y),
+  positive = '1')
+
+confusion_rf <- caret::confusionMatrix(
+  predictions_train_rf,
+  as.factor(ifelse(Y == 1, "X1", "X0")),
+  positive = 'X1')
+
+confusion_xgb <- caret::confusionMatrix(
+  predictions_train_xgb,
+  as.factor(ifelse(Y == 1, "X1", "X0")),
+  positive = 'X1')
+
+results_balAcc <- tibble(
+  Model = c("Elastic Net", 
+            "SuperLearner", 
+            "Random Forest", 
+            "XGBoost",
+            "LSTM"), 
+  "BalancedAccuracy" = c(confusion_enet$byClass['Balanced Accuracy'],
+                          confusion_SL$byClass['Balanced Accuracy'],
+                          confusion_rf$byClass['Balanced Accuracy'], 
+                          confusion_xgb$byClass['Balanced Accuracy'],
+                         '0.7619')) |>  # Calculated in jupyter notebook script
+  mutate(BalancedAccuracy = as.numeric(BalancedAccuracy))
+
+results_balAcc <- results_balAcc |> 
+  rename("Balanced Accuracy" = BalancedAccuracy)
+
+results_balAcc
+```
+
+```{r OLD_results_table}
+# >>> UPDATE THIS TO BE ROW BASED, NOT WIDE
+results_table <- left_join(
+  results_models |> 
+    arrange(desc(AUC)) |> 
+    mutate("Lower AUC-PR" = AUC - AUCSD, 
+           "Upper AUC-PR" = AUC + AUCSD,
+           "Lower Recall" = Recall - RecallSD, 
+           "Upper Recall" = Recall + RecallSD) |> 
+    rename("AUC-PR" = AUC) |> 
+    select(-RecallSD, -AUCSD),
+  
+  results_balAcc,
+  # results_models |> 
+  #   arrange(desc(Recall)) |> 
+  #   mutate("Lower Recall" = Recall - RecallSD, 
+  #          "Upper Recall" = Recall + RecallSD) |> 
+  #   select(-starts_with("AUC"), -RecallSD),
+  by = join_by('Model')
+) |> 
+  mutate(across(where(is.numeric), ~round(. , 3))) |> 
+  arrange(Model) |> 
+  select(Model, "AUC-PR", "Recall", "Balanced Accuracy", everything())
+
+results_table |> 
+  write_csv("../Data/results_table.csv")
+
+# rm(results_models, results_balAcc)
+results_table
+```
+
+```{r results_table}
+# >>> UPDATE THIS TO BE ROW BASED, NOT WIDE
+## Just removed the low/upper split and left the s/d
+results_table <- results_models |>  
+    arrange(desc(AUC)) |> 
+    rename("AUC-PR" = AUC,
+           "AUC-PR sd" = AUCSD,
+           "Recall sd" = RecallSD) |> 
+  mutate(across(where(is.numeric), ~round(. , 3))) |> 
+  arrange(Model)
+
+results_table |> 
+  write_csv("../Data/results_table.csv")
+
+# rm(results_models, results_balAcc)
+results_table
+```
+
+```{r folds_AUC}
+SL_fold_eval <- get_SL_model_eval |>
+  mutate(fold = paste0("Fold ", fold),
+         Model = 'SuperLearner') |>
+  rename(Resample = fold,
+         AUC = prauc,
+         AUC_avg = mean_prauc,
+         Recall = recall,
+         Recall_avg = mean_recall) |>
+  select(AUC, Resample, Model, AUC_avg, Recall, Recall_avg)
+
+
+results_folds <- bind_rows(
+  m_rf$resample |> 
+    filter(mtry == m_rf$bestTune$mtry, 
+           splitrule == m_rf$bestTune$splitrule, 
+           min.node.size == m_rf$bestTune$min.node.size) |> 
+    select(AUC, Recall, Resample) |> 
+    mutate(Model = 'Random Forest', 
+           Resample = str_replace(Resample, "Resample", "Fold ")), 
+  
+  m_enet$resample |> 
+    filter(alpha == m_enet$bestTune$alpha, 
+           lambda == m_enet$bestTune$lambda) |> 
+    select(AUC, Recall, Resample) |> 
+    mutate(Model = 'Elastic Net', 
+           Resample = str_replace(Resample, "Resample", "Fold ")),
+  
+  left_join(m_xgb$bestTune, 
+            m_xgb$resample, 
+            by = join_by(nrounds, max_depth, eta, 
+                         gamma, colsample_bytree, 
+                         min_child_weight, subsample)) |> 
+    select(AUC, Recall, Resample) |> 
+    mutate(Model = "XGBoost", 
+           Resample = str_replace(Resample, "Resample", "Fold ")), 
+  
+  SL_fold_eval,
+  
+  lstm_fold_metrics |> 
+    group_by(param_set) |> 
+    mutate(avg_pr = mean(val_pr)) |> 
+    ungroup() |> 
+    filter(avg_pr == max(avg_pr)) |> 
+    rename(Resample = fold, 
+           AUC = val_pr) |> 
+    mutate(Model = "LSTM", 
+           Resample = as.character(Resample), 
+           Resample = str_c("Fold ", Resample)) |> 
+    select(AUC, Resample, Model)
+  
+) |> 
+  group_by(Model) |> 
+  mutate(AUC_avg = mean(AUC), 
+         Recall_avg = mean(Recall)) |> 
+  ungroup()
+
+folds_table <- results_folds |>
+  pivot_wider(names_from = Resample, 
+              values_from = AUC) |> 
+  select(Model, 'Fold 1', 'Fold 2', 'Fold 3', 'Fold 4', 'Fold 5', 
+         AUC_avg, Recall_avg) 
+
+#results_folds_AUCPR
+#folds_table |> 
+#  arrange(desc(AUC_avg))
+results_folds
+
+# TEMP, add in Recall avg from all results until folds retrain
+results_folds 
+```
+
+```{r viz_AUC}
+plot <- results_folds |> 
+  group_by(Model) |> 
+  mutate(AUC_sd = sd(AUC), 
+         Recall_sd = sd(Recall)) |> 
+  ungroup() |> 
+  ggplot(aes(y = fct_reorder(Model, AUC_avg), 
+             x = AUC_avg)) + 
+  # geom_col(position = 'dodge') + 
+  geom_point(size = 3) +
+  geom_point(aes(x = AUC, 
+                 color = Resample), 
+             alpha = 0.5) + 
+  geom_errorbar(aes(xmin = AUC_avg - AUC_sd,
+                    xmax = AUC_avg + AUC_sd), 
+                width = 0.2) +
+  scale_color_manual(values = c(pals::cols25(n = 5))) +
+  # scale_color_manual(values = c('lightgreen', 'green2', "green3", 
+  #                              'forestgreen', 'darkgreen')) +
+  scale_x_continuous(limits = c(0.25, 0.5)) +
+  theme_minimal() + 
+  theme(legend.position = 'right',
+        plot.title = element_text(size = 14),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(title = 'AUC-PR Cross-Validation Performance',
+       subtitle = "Fold AUC-PR Values indicate training performance was mostly consistent and stable", 
+       y = 'Model', 
+       x = "AUC-PR")
+
+# ggsave("../Visuals/results_folds_AUCPR.png", plot = plot,
+#        width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r viz_both, warning=FALSE}
+# plot <- 
+results_folds_long <- results_folds |> 
+  group_by(Model) |> 
+  mutate(AUC_sd = sd(AUC), 
+         Recall_sd = sd(Recall)) |> 
+  ungroup() |> 
+  
+  # TEMP - Manually dd in the LSTM stuff while the fold data is retrained
+  mutate(Recall_avg = if_else(Model == 'LSTM', 0.776, Recall_avg), 
+         Recall_sd = if_else(Model == 'LSTM', 0.046, Recall_sd)) |> 
+  # REMOVE THIS MUTATE WHEN RETRAINING FINISHES
+  
+  pivot_longer(cols = c(AUC_avg, Recall_avg), 
+               names_to = 'metric',
+               values_to = 'val') |> 
+  mutate(metric = ifelse(metric == "AUC_avg", "AUC-PR", "Recall"))
+
+plot <- results_folds_long |> 
+  ggplot(aes(y = Model, # fct_reorder(Model, val), # can put back when have LSTM
+             x = val)) +
+  facet_grid(~metric, 
+             scales = 'free') +
+  # geom_col(position = 'dodge') + 
+  geom_point(size = 3) +
+  geom_point(data = results_folds_long |> filter(metric == 'AUC-PR'),
+             aes(x = AUC, 
+                 color = Resample), 
+             alpha = 0.5) + 
+  geom_point(data = results_folds_long |> filter(metric == 'Recall'),
+             aes(x = Recall, 
+                 color = Resample), 
+             alpha = 0.5) +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'AUC-PR'),
+                aes(xmin = val - AUC_sd,
+                    xmax = val + AUC_sd), 
+                width = 0.2) +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'Recall'),
+                aes(xmin = val - Recall_sd,
+                    xmax = val + Recall_sd), 
+                width = 0.2) +
+  scale_color_manual(values = c(pals::cols25(n = 5))) +
+  theme_minimal() + 
+  theme(legend.position = 'top',
+        plot.title = element_text(size = 14),
+        axis.text.y = element_text(size = 10),
+        panel.background = element_rect(color = 'lightgrey'),
+        # panel.grid.major.y = element_blank(), 
+        # panel.grid.minor.y = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(title = 'Model Cross-Validation Performance',
+       subtitle = "Fold AUC-PR and Recall Values indicate training performance\nwas mostly consistent and stable", 
+       y = 'Model', 
+       x = "")
+
+ggsave("../Visuals/results_folds_both.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r viz_AUC_poster}
+plot <- results_folds_AUCPR |> 
+  group_by(Model) |> 
+  mutate(AUC_sd = sd(AUC)) |> 
+  ungroup() |> 
+  ggplot(aes(y = fct_reorder(Model, AUC_avg), 
+             x = AUC_avg)) + 
+  # geom_col(position = 'dodge') + 
+  geom_point(size = 3,
+             color = 'white') +
+  geom_point(aes(x = AUC, 
+                 color = Resample)) + 
+  geom_errorbar(aes(xmin = AUC_avg - AUC_sd,
+                    xmax = AUC_avg + AUC_sd), 
+                width = 0.2, 
+                color = 'white') +
+  scale_color_brewer(palette = 'Dark2') + 
+  # scale_color_manual(values = c(pals::cols25(n = 5))) +
+  # scale_color_manual(values = c('lightgreen', 'green2', "green3", 
+  #                              'forestgreen', 'darkgreen')) +
+  scale_x_continuous(limits = c(0.25, 0.5)) +
+  theme_minimal() + 
+  theme(legend.position = 'right',
+        plot.title = element_text(size = 14,
+                                  color = 'white'),
+        plot.subtitle = element_text(color = 'white'),
+        axis.text.x = element_text(color = 'white'),
+        axis.title.x = element_text(color = 'white'),
+        axis.text.y = element_text(size = 10, 
+                                   color = 'white'),
+        legend.text = element_text(color = 'white'),
+        legend.title = element_text(color = 'white'),
+        panel.grid.major.x = element_line(color = 'grey'), 
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(),
+        axis.title.y = element_blank()) +
+  labs(title = 'AUC-PR Cross-Validation Performance',
+       subtitle = "Fold AUC-PR Values indicate training performance was mostly consistent and stable", 
+       y = 'Model',
+       x = 'AUC-PR')
+
+ggsave("../Visuals/results_folds_AUCPR_POSTER.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = '#820000')
+```
+
+```{r viz_AUC_poster_both}
+plot <- results_folds_long |> 
+  ggplot(aes(y = Model, # fct_reorder(Model, val), # can put back when have LSTM
+             x = val)) +
+  facet_grid(~metric, 
+             scales = 'free') +
+  geom_point(size = 3,
+             color = 'white') +
+  geom_point(data = results_folds_long |> filter(metric == 'AUC-PR'),
+             aes(x = AUC, 
+                 color = Resample), 
+             alpha = 0.85) + 
+  geom_point(data = results_folds_long |> filter(metric == 'Recall'),
+             aes(x = Recall, 
+                 color = Resample), 
+             alpha = 0.85) +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'AUC-PR'),
+                aes(xmin = val - AUC_sd,
+                    xmax = val + AUC_sd), 
+                width = 0.2,
+                color = 'white') +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'Recall'),
+                aes(xmin = val - Recall_sd,
+                    xmax = val + Recall_sd), 
+                width = 0.2,
+                color = 'white') +
+  scale_color_manual(values = c(pals::cols25(n = 5))) +
+  theme_minimal() + 
+  theme(legend.position = 'top',
+        # panel.background = element_rect(color = 'white'),
+        panel.border = element_rect(color = 'lightgrey', 
+                                    fill = NA, 
+                                    linewidth = 0.5),
+        strip.text = element_text(color = 'white'),
+        plot.title = element_text(size = 14,
+                                  color = 'white'),
+        plot.subtitle = element_text(color = 'white'),
+        axis.text.x = element_text(color = 'white'),
+        axis.title.x = element_text(color = 'white'),
+        axis.text.y = element_text(size = 10, 
+                                   color = 'white'),
+        legend.text = element_text(color = 'white'),
+        legend.title = element_text(color = 'white'),
+        panel.grid.major.x = element_line(color = 'grey45'), 
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(),
+        axis.title.y = element_blank()) +
+  # scale_x_continuous(n.breaks = 4) + 
+  labs(title = 'Model Cross-Validation Performance',
+       subtitle = "Fold AUC-PR and Recall Values indicate training performance was mostly consistent and stable", 
+       y = 'Model', 
+       x = "")
+
+ggsave("../Visuals/results_folds_both_POSTER.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = '#820000')
+```
+
+```{r viz_AUC_poster_both_in}
+plot <- results_folds_long |> 
+  ggplot(aes(y = Model, # fct_reorder(Model, val), # can put back when have LSTM
+             x = val)) +
+  facet_grid(~metric, 
+             scales = 'free') +
+  geom_point(size = 12,
+             color = 'white') +
+  geom_point(data = results_folds_long |> filter(metric == 'AUC-PR'),
+             aes(x = AUC, 
+                 color = Resample), 
+             size = 8,
+             alpha = 0.85) + 
+  geom_point(data = results_folds_long |> filter(metric == 'Recall'),
+             aes(x = Recall, 
+                 color = Resample), 
+             size = 8,
+             alpha = 0.85) +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'AUC-PR'),
+                aes(xmin = val - AUC_sd,
+                    xmax = val + AUC_sd), 
+                width = 0.1,
+                color = 'white') +
+  geom_errorbar(data = results_folds_long |> filter(metric == 'Recall'),
+                aes(xmin = val - Recall_sd,
+                    xmax = val + Recall_sd), 
+                width = 0.1,
+                color = 'white') +
+  scale_color_manual(values = c(pals::cols25(n = 5))) +
+  theme_minimal() + 
+  theme(legend.position = 'bottom',
+        legend.box.margin = margin(t = 12, b = 12),
+        panel.border = element_rect(color = 'lightgrey', 
+                                    fill = NA, 
+                                    linewidth = 0.5),
+        strip.text = element_text(size = 40,
+                                  color = 'white'),
+        plot.title = element_text(size = 48,
+                                  face = 'bold',
+                                  color = 'white'),
+        plot.subtitle = element_text(size = 44,
+                                     margin = margin(b = 20),
+                                     color = 'white'),
+        axis.text.x = element_text(size = 40,
+                                   color = 'white'),
+        axis.title.x = element_text(color = 'white'),
+        axis.text.y = element_text(size = 40, 
+                                   color = 'white'),
+        legend.text = element_text(size = 40,
+                                   color = 'white'),
+        legend.title = element_text(size = 40,
+                                    color = 'white'),
+        panel.grid.major.x = element_line(color = 'grey45'), 
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(),
+        axis.title.y = element_blank()) +
+  # scale_x_continuous(n.breaks = 4) + 
+  labs(title = 'Model Cross-Validation Performance',
+       subtitle = "Fold AUC-PR and Recall Values indicate training performance was mostly consistent and stable", 
+       y = 'Model', 
+       x = "")
+
+ggsave("../Visuals/results_folds_both_POSTER_in.png", plot = plot,
+       width = 35, height = 17.5, dpi = 600, units = 'in',
+       bg = '#820000')
+```
+
+## IMV
+
+### Test Set
+
+```{r prep_probs}
+# Random Forest
+predictions_test_rf_probs <- predict(m_rf, test |> mutate(year = as.factor(year)), 
+                                     type = 'prob') 
+predictions_test_rf_probs_imv <- 
+  predictions_test_rf_probs["X1"] |> 
+  pull()
+
+# XGBoost
+predictions_test_xgb_probs <- predict(m_xgb, test, 
+                                      type = 'prob') 
+predictions_test_xgb_probs_imv <- 
+  predictions_test_xgb_probs[1] |> pull()
+
+# Elastic Net
+predictions_test_enet_down_probs <- predict(m_enet_down, test |> mutate(year = as.factor(year)), 
+                                            type = 'prob') 
+predictions_test_enet_down_probs_imv <- 
+  predictions_test_enet_down_probs[1] |> 
+  pull()
+
+# SuperLearner
+#predictions_test_SL_probs <- predict(m_SL$AllSL, 
+#                                     test |> select(-extreme_closure_10pct_over_5yr),
+#                                     onlySL = T) 
+#predictions_test_SL_probs_imv <- predictions_test_SL_probs
+
+# Truth
+truth_test <- if_else(test$extreme_closure_10pct_over_5yr == "X1", 1, 0)
+```
+
+```{r calc_test_CV_IMVs, warning=FALSE}
+imv_cvs_test <- bind_rows(
+  imv_cv(y_basic = rep(mean(truth_test), length(truth_test)), 
+         y_enhanced = predictions_test_rf_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'Random Forest'),
+  
+  imv_cv(y_basic = rep(mean(truth_test), length(truth_test)),  
+         y_enhanced = predictions_test_xgb_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'XGBoost'),
+  
+  imv_cv(y_basic = rep(mean(truth_test), length(truth_test)), 
+         y_enhanced = predictions_test_enet_down_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'Elastic Net') #,
+  
+  # imv_cv(y_basic = rep(mean(truth_test), length(truth_test)), 
+  #        y_enhanced = predictions_test_SL_probs_imv, 
+  #        y = truth, 
+  #        folds = folds) |> 
+  #   summarize(fold_avg = mean(IMV)) |> 
+  #   mutate(Model = 'SuperLearner')
+)
+
+imv_cvs_test
+```
+
+### Train Set
+
+```{r prep_probs}
+# Random Forest
+predictions_train_rf_probs_imv <- 
+  
+  predictions_train_rf_probs[1] |> 
+  pull()
+
+# XGBoost
+predictions_train_xgb_probs_imv <- 
+  predictions_train_xgb_probs[1] |> pull()
+
+# Elastic Net
+predictions_train_enet_down_probs_imv <- 
+  predictions_train_enet_down_probs[1] |> 
+  pull()
+
+# SuperLearner
+predictions_train_SL_probs_imv <- m_SL$SL.predict
+
+truth <- Y
+```
+
+```{r calc_CV_IMVs, warning=FALSE}
+imv_cvs <- bind_rows(
+  imv_cv(y_basic = rep(mean(truth), length(truth)), 
+         y_enhanced = predictions_train_rf_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'Random Forest'),
+  
+  imv_cv(y_basic = rep(mean(truth), length(truth)), 
+         y_enhanced = predictions_train_xgb_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'XGBoost'),
+  
+  imv_cv(y_basic = rep(mean(truth), length(truth)), 
+         y_enhanced = predictions_train_enet_down_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'Elastic Net'),
+  
+  imv_cv(y_basic = rep(mean(truth), length(truth)), 
+         y_enhanced = predictions_train_SL_probs_imv, 
+         y = truth, 
+         folds = folds) |> 
+    summarize(fold_avg = mean(IMV)) |> 
+    mutate(Model = 'SuperLearner')
+)
+
+imv_cvs
+```
+
+# Test Set Performance
+
+Chosen Model: XGBoost (higher AUC-PR with less variance, 2nd best recall
+
+```{r test_preds}
+# NOTE, models were trained with yearFEs and using unstandardized data (processing was handled in the CV process)
+test_new <- test |> mutate(year = as.factor(year))
+
+predictions_test <- predict(m_xgb, test_new)
+
+confusion_test <- caret::confusionMatrix(
+  predictions_test,
+  test_new$extreme_closure_10pct_over_5yr,
+  positive = 'X1'
+)
+
+confusion_test
+```
+
+```{r}
+confusion_xgb_urban <- test_new |> 
+  mutate(pred = predictions_test) |> 
+  filter(recent_locale_simp == "Urban") 
+
+
+confusion_test_urban <- caret::confusionMatrix(
+  confusion_xgb_urban$pred,
+  confusion_xgb_urban$extreme_closure_10pct_over_5yr,
+  positive = 'X1'
+)
+
+confusion_test_urban
+```
+
+```{r rf_CV_plot}
+plot <- m_rf$results |> 
+  mutate(min.node.size = paste("min.node.size: ", as.character(min.node.size))) |> 
+  ggplot(aes(x = mtry,
+             y = AUC, 
+             color = splitrule)) + 
+  facet_grid(~min.node.size) +
+  geom_point() + 
+  geom_line() +
+  theme_minimal() + 
+  theme(legend.position = 'top') +
+  labs(title = 'Random Forest Cross-Validation Performance',
+       subtitle = paste0("Best Parameter Combination: ", 
+                         "min.node.size = ", m_rf$bestTune$min.node.size, ", ", 
+                         "splitting rule = ", m_rf$bestTune$splitrule, ", ", 
+                         "mtry = ", m_rf$bestTune$mtry),
+       y = 'AUC-PR (Cross-Validation)', 
+       x = 'Number of Randomly Selected Predictors', 
+       color = "Splitting Rule") 
+
+ggsave("../Visuals/rf_CV_plot.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r varImp, message=FALSE}
+# Compute the variable importance using caret's varImp function
+importance_df <- varImp(m_xgb)$importance
+
+# Add variable names as a separate column (rownames contain the feature names)
+importance_df$Variable <- rownames(importance_df)
+
+# Plot the overall importance using ggplot2
+plot <- importance_df |> 
+  mutate(Variable = str_remove(Variable, "avg_")) |> 
+  arrange(desc(Overall)) |> 
+  filter(Overall >= mean(Overall)) |> 
+  #slice_head(n = 30) |> 
+  ggplot(aes(y = reorder(Variable, Overall), 
+             x = Overall)) +
+  geom_point(size = 2.5,
+             stat = "identity", 
+             color = "darkgreen") +
+  geom_errorbar(aes(xmax = Overall), 
+                xmin = 0, 
+                width = 0, 
+                color = 'darkgreen') + 
+  labs(title = "Overall Variable Importance",
+       subtitle = 'Importance Scores for variables with more than the\naverage overall importance.',
+       y = "Variables",
+       x = "Importance") + 
+  theme_minimal() + 
+  theme(panel.grid.major.y = element_blank(), 
+        panel.grid.minor.y = element_blank(),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 14), 
+        plot.title = element_text(size = 18),
+        plot.subtitle = element_text(size = 16))
+
+ggsave("../Visuals/xgb_importance.png", plot = plot,
+       width = 8, height = 10, dpi = 600, bg = 'white')
+
+plot
+```
+
+# Error Analysis
+
+```{r attach_and_eval_overall}
+test_new_w_preds <- test_new |> 
+  mutate(prediction = predictions_test, 
+         .after = extreme_closure_10pct_over_5yr, 
+         correct_pred = extreme_closure_10pct_over_5yr == prediction)
+
+test_new_w_preds |>  
+  group_by(year) |> 
+  summarize(avg_correct = mean(correct_pred)) |> 
+  ungroup() |> 
+  ggplot(aes(x = year, y = avg_correct)) + 
+  geom_col()
+
+test_new_w_preds |>  
+  group_by(dist_state_abbr) |> 
+  summarize(avg_correct = mean(correct_pred)) |> 
+  ungroup() |> 
+  ggplot(aes(y = dist_state_abbr, x = avg_correct)) + 
+  geom_col()
+
+test_new_w_preds |>  
+  group_by(recent_locale_simp) |> 
+  summarize(avg_correct = mean(correct_pred)) |> 
+  ungroup() |> 
+  ggplot(aes(x = recent_locale_simp, y = avg_correct)) + 
+  geom_col()
+
+test_new_w_preds |>  
+  group_by(recent_type) |> 
+  summarize(avg_correct = mean(correct_pred)) |> 
+  ungroup() |> 
+  ggplot(aes(y = recent_type, x = avg_correct)) + 
+  geom_col()
+```
+
+```{r examine_mistakes}
+mistakes <- test_new_w_preds |> 
+  filter(correct_pred == FALSE) |> 
+  mutate(type = if_else(prediction == 'X0', "False Negative", 
+                        "False Positive"), 
+         .after = correct_pred)
+
+mistakes_count <- mistakes |> 
+  group_by(recent_locale_simp) |> 
+  summarize(#n_FN = sum(type == 'False Negative'), 
+            #n_FP = sum(type == 'False Positive'),
+            p_FN = sum(type == 'False Negative')/nrow(mistakes |> 
+                                                        filter(type == 'False Negative')), 
+            p_FP = sum(type == 'False Positive')/nrow(mistakes |> 
+                                                        filter(type == 'False Positive'))) |> 
+  ungroup() |> 
+  pivot_longer(cols = -recent_locale_simp, 
+               names_to = 'error_type', 
+               values_to = 'count') 
+```
+
+```{r mistakes_by_locale}
+# I want the % of urban dists that are FN/FP not vice versa
+plot <- test_new_w_preds |> 
+  mutate(mistake_type = if_else(correct_pred == F, 
+                                if_else(prediction == 'X0', 
+                                        "False Negative", 
+                                        "False Positive"), 
+                                'Correct'), 
+         .after = correct_pred) |> 
+  group_by(recent_locale_simp, mistake_type) |> 
+  summarize(n = n(), .groups = 'drop') |> 
+  group_by(recent_locale_simp) |> 
+  mutate(pct = n/sum(n)) |> 
+  ungroup() |> 
+  ggplot(aes(x = recent_locale_simp, 
+             y = pct, 
+             fill = mistake_type)) +
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) +
+  geom_col() + 
+  geom_text(aes(label = paste0(round(pct*100, 1), "%")), 
+            nudge_y = 0.05,
+            size = 4) +
+  facet_wrap(~mistake_type, scales = 'free_x') + 
+  theme_minimal() + 
+  theme(legend.position = 'top', 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), 
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank()) +
+  labs(title = 'Percentage of Each Mistake Type within Locales',
+       subtitle = 'For example, 65.3% of all Urban predictions were correct.',
+       x = 'Locale',
+       fill = 'Mistake Type')
+
+ggsave("../Visuals/mistakes_dists_locale.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r OLD_mistakes_by_locale}
+plot <- mistakes_count |> 
+  mutate(error_type = if_else(error_type == 'p_FN', 'False Negatives', "False Positives")) |> 
+  ggplot(aes(x = recent_locale_simp, 
+             y = count, 
+             fill = error_type)) + 
+  geom_col() + 
+  geom_text(aes(label = paste0(round(count*100, 2), "%")), 
+            nudge_y = 0.02,
+            size = 5) +
+  facet_wrap(~error_type) + 
+  # scale_y_continuous(labels = scales::label_percent(), 
+  #                    limits = c(0, 0.50)) + 
+  scale_fill_manual(values = c('orange2', 'purple')) +
+  theme_minimal() + 
+  theme(legend.position = 'none', 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), 
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        strip.text = element_text(size = 14),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank()) + 
+  labs(title = 'Distribution of Mistakes by Locale', 
+       subtitle = 'Percentage Breakdown of each type of mistake across locales',
+       x = 'Locale')
+
+ggsave("../Visuals/mistakes_dists_locale.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r errors_by_distType, message=FALSE)}
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False\nNegative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False\nPositive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  group_by(recent_type) |> 
+  mutate(type_count = n(), 
+         .after = type) |> 
+  ungroup() |> 
+  group_by(type, recent_type) |> 
+  mutate(count = n(), 
+           pct = count/type_count,
+         .after = type_count) |> 
+  select(type, recent_type, pct) |> 
+  distinct() |> 
+  ggplot(aes(x = type,
+             y = pct,
+             fill = type)) +
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(pct*100, 2), "%")), 
+            nudge_y = 0.04,
+            size = 4) +
+  facet_grid(~recent_type, scales = 'free_x',
+             labeller = labeller(recent_type = label_wrap_gen(width = 30))) +
+  theme_minimal() +
+  theme(legend.position = 'none',
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), 
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        strip.text = element_text(size = 12),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank()) +
+  labs(x = "Error Type",
+       y = '',
+       title = 'Distribution of Mistakes within District Types',
+       subtitle = 'Percentage of Predictions of Each Type')
+
+ggsave("../Visuals/mistakes_dists_types.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r errors_by_state, message=FALSE)}
+state_pcts <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  group_by(type, dist_state_abbr) |> 
+  summarize(count = n(), .groups = 'drop') |> 
+  ungroup() |> 
+  group_by(dist_state_abbr) |> 
+  mutate(pct = count/sum(count)) |> 
+  ungroup() |> 
+  select(-count) |> 
+  mutate(type = case_when(type == 'False Positive' ~ "FP", 
+                          type == 'False Negative' ~ "FN", 
+                          .default = 'C')) |> 
+  pivot_wider(names_from = type, 
+              values_from = pct)
+
+mean_state_FNpct <- mean(state_pcts$FN, na.rm = T)
+mean_state_FPpct <- mean(state_pcts$FP, na.rm = T)
+
+plot <- state_pcts |> 
+  filter(FN > mean_state_FNpct | FP > mean_state_FPpct) |> 
+  pivot_longer(cols = -dist_state_abbr, 
+               names_to = 'type', 
+               values_to = 'pct') |> 
+  mutate(type = case_when(type == 'FP' ~ 'False\nPositive', 
+                          type == 'FN' ~ 'False\nNegative', 
+                          .default = 'Correct'), 
+         pct = if_else(is.na(pct), 0, pct)) |> 
+  filter(type != 'Correct') |> 
+  ggplot(aes(x = type, 
+             y = pct, 
+             fill = type)) + 
+  geom_col() + 
+  geom_text(aes(label = paste0(round(pct*100, 2), "%")), 
+            size = 2.5, 
+            nudge_y = 0.1) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  scale_fill_manual(values = c(# 'darkgreen', 
+                               'orange2', 'purple')) + 
+  facet_wrap(~dist_state_abbr, scales = 'free_x') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 6),
+        legend.position = 'none', 
+        plot.caption = element_text(size = 7),
+        axis.text.y = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank(),
+        axis.title.y = element_blank()) + 
+  labs(fill = "Prediction was: ",
+       x = 'Error Type',
+       caption = paste0(
+         'NOTE: Any state with a False Positive was included due to the low amount of False Positives', '\n',
+         "Mean False Negative Percentage = ", round(mean_state_FNpct*100, 1), "%\n",
+          "Mean False Positive Percentage = ", round(mean_state_FPpct*100, 1), "%"),
+       subtitle = 'Percentage of Observations in Each State',
+       title = 'States with More than the State Average Number of Either Error Type')
+
+ggsave("../Visuals/state errors.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+# plot
+```
+
+```{r OLD_different_numeric_dists, message=FALSE}
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |>
+  select(correct_pred, type,  
+         avg_schl_pct_dist_enroll_avg,
+         avg_schl_pct_dist_enroll_min,
+         avg_schl_pct_dist_enroll_max,
+         avg_schl_tot_wht_sd,
+         avg_schl_tot_students_min,
+         avg_schl_pct_frpl_max) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  mutate(variable = case_when(
+    variable == 'avg_schl_pct_dist_enroll_avg' ~ "A - Average School\nEnrollment Concentration", 
+    variable == 'avg_schl_pct_dist_enroll_min' ~ "B - Minimum School\nEnrollment Concentration",
+    variable == 'avg_schl_pct_dist_enroll_max' ~ 'C - Max School\nEnrollment Concentration',
+    variable == 'avg_schl_tot_wht_sd' ~ "E - Std Deviation of\nNumber of White Students",
+    variable == 'avg_schl_tot_students_min' ~ 'D - Minimum Number of Students',
+    variable == 'avg_schl_pct_frpl_max' ~ "F - Max Percent of Free-Reduced\nPrice Lunch Students"
+    )) |> 
+  ggplot(aes(x = value, 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free_x') + 
+  # scale_fill_manual(values = c('skyblue3', 'orange2')) + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme_minimal() + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Distributions for Visible Differences')
+
+ggsave("../Visuals/diff_numeric_dists_breakdown.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r different_numeric_dists, message=FALSE}
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |>
+  select(correct_pred, type,  
+         avg_schl_pct_frpl_max, 
+         avg_schl_pct_frpl_sd,
+         contains("schl_pct_dist_enroll"),
+         contains("schl_tot_wht"), 
+         contains("schl_tot_students"), 
+         -avg_schl_tot_students_max,
+         dist_tot_students,
+         num_schools) |> 
+  mutate(dist_tot_students = log(dist_tot_students + 1e-8),
+         num_schools = log(num_schools + 1e-8)) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  mutate(variable = str_remove(variable, 'avg_')) |> 
+  mutate(variable = case_when(
+    variable == 'schl_pct_dist_enroll_avg' ~ "School Enrollment\nConcentration - Average", 
+    variable == 'schl_pct_dist_enroll_min' ~ "School Enrollment\nConcentration - Min",
+    variable == 'schl_pct_dist_enroll_max' ~ 'School Enrollment\nConcentration - Max',
+    variable == 'schl_pct_dist_enroll_sd' ~ 'School Enrollment\nConcentration - SD',
+    variable == 'schl_pct_frpl_sd' ~ "School Percent of Free-Reduced\nPrice Lunch Students (SD)",
+    variable == 'schl_pct_frpl_max' ~ "School Percent of Free-Reduced\nPrice Lunch Students (Max)",
+    variable == 'schl_tot_wht_avg' ~ "School Number of White\nStudents (Average)",
+    variable == 'schl_tot_wht_max' ~ "School Number of White\nStudents (Max)",
+    variable == 'schl_tot_wht_min' ~ "School Number of White\nStudents (Min)",
+    variable == 'schl_tot_wht_sd' ~ "School Number of White\nStudents (SD)",
+    variable == 'schl_tot_students_min' ~ 'School Number of Students\n(Min)',
+    variable == 'schl_tot_students_avg' ~ 'School Number of Students\n(Average)',
+    variable == 'schl_tot_students_sd' ~ 'School Number of Students\n(SD)',
+    variable == 'dist_tot_students' ~ "District Number of Students",
+    variable == 'num_schools' ~ "Number of Schools in District"
+    )) |> 
+  ggplot(aes(x = value, 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free_x', ncol = 3) + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme_minimal() + 
+  theme(legend.position = 'top', 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_text(size = 10), 
+        axis.text.x = element_text(size = 10), 
+        axis.title.x = element_text(size = 10), 
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        strip.text = element_text(size = 11)) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of Numeric Predictors Between Correct and\nIncorrect Predictions', 
+       subtitle = 'Distributions for Visible Differences')
+
+ggsave("../Visuals/diff_numeric_dists_breakdown.png", plot = plot,
+       width = 8, height = 10, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r case_study}
+test_new_w_preds |> 
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         .before = year) |> 
+  filter(extreme_closure_10pct_over_5yr == "X1") |> 
+  group_by(agency_id, year) |> 
+  arrange(desc(dist_tot_students)) |> 
+  ungroup() |> 
+  select(extreme_closure_10pct_over_5yr:year, dist_state_abbr, 
+         dist_tot_students, everything())
+
+test_new_w_preds |>
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         .before = year) |> 
+  filter(agency_id == "4218990")
+```
+
+```{r case_study_STATE}
+test_new_w_preds |> 
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         state = data_5yr_base_omit_splits$test_original$dist_state_abbr,
+         .before = year) |> 
+  group_by(state) |> 
+  summarize(pct_correct = sum(correct_pred == T)/n(),
+            .groups = 'drop') |> 
+  arrange(desc(pct_correct))
+
+
+# WHY IS NUM_CLOSED 0?? (T_T)
+test_new_w_preds |> 
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         state = data_5yr_base_omit_splits$test_original$dist_state_abbr,
+         .before = year) |> 
+  filter(state == "MT") |> 
+  filter(extreme_closure_10pct_over_5yr == 'X1')
+
+
+# Check Jersey... Something seems very off with the outcome... maybe because I'm filtering to X1's but worth double checking...
+
+# Check 
+test_new_w_preds |> 
+  mutate(agency_id = data_5yr_base_omit_splits$test_original$agency_id,
+         state = data_5yr_base_omit_splits$test_original$dist_state_abbr,
+         .before = year) |> 
+  filter(state == "NY") |> 
+  filter(extreme_closure_10pct_over_5yr == 'X1')
+```
+
+```{r case_study_CA}
+# data_imputed <- readRDS("../Sherlock/imputations_TRAIN_full2.rds")
+
+test_CA <- data_imputed |> 
+  filter(dist_state_abbr == 'CA')
+
+# Suppose your original training frame was called `train`
+state_lvls <- levels(
+  droplevels(data_5yr_base_omit_splits$train_original$dist_state_abbr)
+  )
+
+test_CA_selected <- test_CA |>
+  select(-c(extreme_closure_10pct_over_5yr, agency_id)) |>
+  mutate(dist_state_abbr = factor(dist_state_abbr,                        
+                                  levels = state_lvls))
+
+# ----------
+
+# 1. grab the same feature columns you used in training
+feature_names <- setdiff(
+  names(data_5yr_base_omit_splits$train_original),
+  c("extreme_closure_10pct_over_5yr", "agency_id")
+)
+
+# 2. create a numeric matrix for test
+test_mat <- model.matrix(
+  ~ . - 1,
+  data = test_CA[, feature_names]
+)
+
+# 3. wrap in xgb.DMatrix
+dtest <- xgb.DMatrix(data = test_mat)
+
+# 4. predict
+predictions_test_CA <-  predict(m_xgb$finalModel, dtest)
+
+# --------
+
+predictions_test_CA <- predict(m_xgb, test_CA_selected)
+
+confusion_test_CA <- caret::confusionMatrix(
+  predictions_test_CA,
+  test_CA$extreme_closure_10pct_over_5yr,
+  positive = 'X1'
+)
+
+confusion_test_CA
+```
+
+# Appendix
+
+```{r predictor_desc_table}
+predictor_desc_table <- tibble(
+    Variable = names(train),
+    Type = map_chr(train, ~ class(.x)[1])) |> 
+  mutate(Variable = str_remove(Variable, "avg_"),
+         Variable = str_remove(Variable, "sd_"),
+         Variable = str_remove(Variable, "min_"),
+         Variable = str_remove(Variable, "max_"),
+         Variable = str_remove(Variable, "_avg"),
+         Variable = str_remove(Variable, "_sd"),
+         Variable = str_remove(Variable, "_min"),
+         Variable = str_remove(Variable, "_max")) |> 
+  distinct()
+  
+predictor_desc_table <- predictor_desc_table |> 
+  mutate(Description = c(
+      "Outcome", 
+      "Year for the data in a given row", 
+      "Number of Schools Closed this year", 
+      "Total Number of Schools", 
+      "Number of Schools More Diverse than the District (i.e. smaller Theil index)",
+      "Number of Elementary Schools", "Number of Middle Schools", "Number of High Schools", 
+      "Number of Schools without a specific level",
+      "Number of Charter Schools", 
+      "Number of Magnet Schools", "Number of Schools recieving Title-1 Funding", 
+      "Theil Index among the districts' schools (see Methods) (Mean/SD/Min/Max)", 
+      "Student-Teacher Ratio within Schools (Mean/SD/Min/Max)", 
+      "School Total Number of Students Recieving Free-Reduced Price Lunch (Mean/SD/Min/Max)", 
+      "School Total Number of American Indian Students (Mean/SD/Min/Max)", 
+      "School Total Number of Asian Students (Mean/SD/Min/Max)", 
+      "School Total Number of Hispanic Students (Mean/SD/Min/Max)", 
+      "School Total Number of Black Students (Mean/SD/Min/Max)", 
+      "School Total Number of White Students (Mean/SD/Min/Max)", 
+      "School Total Number of Students with Other Racial Classifications (Mean/SD/Min/Max)", 
+      "School Total Number of Students Enrolled (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is Black (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is White (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is Hispanic (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is American Indian (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is Asian (Mean/SD/Min/Max)", 
+      "Proportion of School Population that is Another Race not listed here (Mean/SD/Min/Max)", 
+      "Proportion of School Population that Recieves Free-Reduced Lunch (Mean/SD/Min/Max)", 
+      "Percentage of the Districts' Total Enrollment Residing in 1 School (Mean/SD/Min/Max)", 
+      "State district resides in", 
+      "Total District Enrollment", 
+      "District per-pupil Expenditure", 
+      "District Student-Teacher Ratio", 
+      "Proportion of District Population that is Black", 
+      "Proportion of District Population that is White", 
+      "Proportion of District Population that is Hispanic", 
+      "Proportion of District Population that is Asian", 
+      "Proportion of District Population that Recieves Free-Reduced Lunch", 
+      "Proportion of District Population that is Another Race Not Listed Here",
+      "District Theil Index", 
+      "Districts' Most Recent Type (as labeled by NCES)", 
+      "Districts' Most Recent Locale (as reported by NCES)", 
+      "Number of Schools Opened"))
+
+predictor_desc_table |> 
+  write_csv("../Data/predictor_desc_table.csv")
+predictor_desc_table
+```
+
+```{r appendix_all_numeric_dists, message=FALSE}
+plot <- test_new_w_preds |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  ggplot(aes(x = value, 
+             fill = correct_pred)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('lightgreen', 'darkgreen')) + 
+  theme(legend.position = 'top', 
+        plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of Numeric Predictors\nBetween Correct and Incorrect Predictions')
+
+ggsave("../Visuals/appendix_all_numeric_dists.png", plot = plot,
+       width = 8, height = 4.5, dpi = 600, bg = 'white')
+
+plot
+```
+
+```{r appendix_all_numeric_allVars, message=FALSE}
+# SPLIT OUT INTO SCHOOL AND DISTRICT LEVEL
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  ggplot(aes(x = value, 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Incorrect Predictions Broken Apart by Type')
+
+ggsave("../Visuals/appendix_all_numeric_dists_breakdown.png", plot = plot,
+       width = 16, height = 9, dpi = 600, bg = 'white')
+
+# plot
+```
+
+```{r appendix_all_numeric_distsOnly, message=FALSE}
+# SPLIT OUT INTO SCHOOL AND DISTRICT LEVEL
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  select(type, correct_pred, starts_with('dist'), starts_with('num')) |> 
+  mutate(across(c(starts_with('num'), dist_pct_oth, dist_tot_students), ~log(. + 1e-8))) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  ggplot(aes(x = value, 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_text(size = 12), 
+        axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 14), 
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        strip.text = element_text(size = 12)) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of District-Level Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Incorrect Predictions Broken Apart by Type')
+
+ggsave("../Visuals/appendix_all_numeric_distsOnly.png", plot = plot,
+       width = 16, height = 9, dpi = 600, bg = 'white')
+
+# plot
+```
+
+```{r appendix_all_numeric_schlsOnly, message=FALSE}
+# SPLIT OUT INTO SCHOOL AND DISTRICT LEVEL
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  select(type, correct_pred, everything(), -starts_with('dist'), -starts_with('num')) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  ggplot(aes(x = value, 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of School-Level Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Incorrect Predictions Broken Apart by Type')
+
+ggsave("../Visuals/appendix_all_numeric_schlsOnly.png", plot = plot,
+       width = 16, height = 9, dpi = 600, bg = 'white')
+
+# plot
+```
+
+```{r appendix_all_numeric_schlsOnly_logged, message=FALSE}
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  select(type, correct_pred, everything(), -starts_with('dist'), -starts_with('num')) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |>
+  mutate(variable = str_remove(variable, "avg_")) |> 
+  ggplot(aes(x = log(value + 1e-8), 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of School-Level Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Incorrect Predictions Broken Apart by Type')
+
+ggsave("../Visuals/appendix_all_numeric_schlsOnly_log.png", plot = plot,
+       width = 16, height = 9, dpi = 600, bg = 'white')
+
+# plot
+```
+
+```{r appendix_all_numeric_schlsOnly_logged, message=FALSE}
+
+plot <- test_new_w_preds |> 
+  mutate(type = case_when(correct_pred == FALSE & prediction == 'X0' ~ "False Negative",
+                          correct_pred == FALSE & prediction == 'X1' ~ "False Positive",
+                          .default = 'Correct'), 
+         .after = correct_pred) |> 
+  mutate(correct_pred = if_else(correct_pred == T, "Correct", 'Incorrect')) |> 
+  select(type, correct_pred, everything(), -starts_with('dist'), -starts_with('num')) |> 
+  pivot_longer(cols = where(is.numeric), 
+               names_to = 'variable',
+               values_to = 'value') |> 
+  mutate(variable = str_remove(variable, "avg_")) |> 
+  ggplot(aes(x = log(value + 1e-8), 
+             fill = type)) + 
+  ggridges::geom_density_ridges(aes(y = correct_pred),
+                                alpha = 0.9) + 
+  facet_wrap(~variable,, scales = 'free') + 
+  scale_fill_manual(values = c('darkgreen', 'orange2', 'purple')) + 
+  theme(legend.position = 'top', 
+        # plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank()) + 
+  labs(fill = 'Prediction was: ', 
+       x = 'Value',
+       title = 'Distributions of School-Level Numeric Predictors Between Correct and Incorrect Predictions', 
+       subtitle = 'Incorrect Predictions Broken Apart by Type')
+
+ggsave("../Visuals/appendix_all_numeric_schlsOnly_log.png", plot = plot,
+       width = 16, height = 9, dpi = 600, bg = 'white')
+
+# plot
+```

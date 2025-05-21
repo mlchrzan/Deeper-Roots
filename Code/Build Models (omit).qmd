@@ -1,0 +1,1124 @@
+---
+title: "Build Models"
+format: html
+editor: visual
+---
+
+```{r libraries, message=FALSE}
+library(caret) # for managing the training process (right now just for RF and XGB)
+library(PRROC) # For AUC-PR eval metrics
+library(doParallel) # for parallel processing
+library(tidyverse) 
+
+# Modeling packages
+library(glmmLasso) # for Lasso Multilevel model
+library(SuperLearner)
+library(dplyr)     
+library(ranger)    
+library(xgboost)   
+library(gam)       
+```
+
+```{r make_yearFE}
+# Create year-based fixed effects and set raw data to be standardized during CV
+train_yearFE <- data_5yr_base_omit_splits$train_original |>
+  mutate(year = as.factor(year)) 
+
+# Update factor level order for prSummary
+train_yearFE$extreme_closure_10pct_over_5yr <- 
+  factor(train_yearFE$extreme_closure_10pct_over_5yr, 
+         levels = c("X1", "X0"))
+
+# Save training data from omitted dataset
+train_yearFE |> 
+  write_csv(file = "../Data/data_5yr_base_omit_TRAIN_yearFE.csv")
+```
+
+# All Predictors
+
+## LASSO Multilevel Regression
+
+```{r m_glmmLasso}
+# cl <- makeCluster(detectCores() - 6)
+# registerDoParallel(cl)
+
+#--------------------------------------------------------------------------
+# Regularized Multilevel Models for Rare Binary Outcomes in R using glmmLasso
+# with Cross-Validation for Lambda Tuning based on AUC-PR
+#--------------------------------------------------------------------------
+# This script demonstrates how to fit a LASSO-penalized multilevel model
+# for a rare binary outcome using the 'glmmLasso' package.
+# It includes k-fold cross-validation to select the optimal LASSO penalty
+# parameter ('lambda') by maximizing the Area Under the Precision-Recall Curve
+# (AUC-PR) on held-out data.
+#--------------------------------------------------------------------------
+
+#--------------------------------------------------------------------------
+# Cross-Validation Setup
+#--------------------------------------------------------------------------
+k_folds <- 5 # Number of folds for CV
+# NOTE folds created in split_data, see "Prep for Models.qmd"
+
+# Define the sequence of lambda values to test
+# Adjust the range and granularity based on your data and initial runs
+lambdas_to_try <- seq(1, 50, by = 2) # Example sequence
+
+# Matrix to store AUC-PR results (rows=folds, cols=lambdas)
+cv_auc_pr_results <- matrix(NA, nrow = k_folds, 
+                            ncol = length(lambdas_to_try))
+colnames(cv_auc_pr_results) <- paste0("lambda_", lambdas_to_try)
+
+#--------------------------------------------------------------------------
+# Remove linear dependencies 
+#--------------------------------------------------------------------------
+my_data <- data_5yr_base_omit_splits$train_original
+
+# Make outcome numeric
+my_data <- my_data |> 
+  mutate(extreme_closure_10pct_over_5yr = if_else(
+    extreme_closure_10pct_over_5yr == 'X1', 1, 0
+  ))
+
+# Get all column names except 'extreme_closure_10pct_over_5yr' and 'agency_id'
+predictors <- setdiff(names(my_data), 
+                     c("extreme_closure_10pct_over_5yr", 
+                       "agency_id"))
+
+# Construct formula string explicitly
+formula_str <- paste("extreme_closure_10pct_over_5yr ~", 
+                     paste(predictors, collapse = " + "))
+
+# Convert to formula object
+fixed_formula <- as.formula(formula_str)
+
+# Remove linear dependencies 
+df <- model.matrix(fixed_formula, data = my_data)
+linearCombos <- findLinearCombos(df)
+my_data <- df[, -linearCombos$remove]
+my_data <- as.data.frame(my_data) |> 
+  dplyr::select(-"(Intercept)") |> 
+  mutate(agency_id = data_5yr_base_omit_splits$train_original$agency_id,
+         agency_id = as.factor(agency_id),
+         extreme_closure_10pct_over_5yr = 
+           data_5yr_base_omit_splits$train_original$extreme_closure_10pct_over_5yr, 
+         extreme_closure_10pct_over_5yr = if_else(
+           extreme_closure_10pct_over_5yr == 'X1', 1, 0),
+         .before = year) |> 
+  janitor::clean_names()
+rm(df)
+
+# Reconstruct formula with new predictors
+predictors <- setdiff(names(my_data), 
+                     c("extreme_closure_10pct_over_5yr", 
+                       "agency_id"))
+
+# Construct formula string explicitly
+formula_str <- paste("extreme_closure_10pct_over_5yr ~", 
+                     paste(predictors, collapse = " + "))
+
+# Convert to formula object
+fixed_formula <- as.formula(formula_str)
+
+
+#--------------------------------------------------------------------------
+# Perform k-Fold Cross-Validation
+#--------------------------------------------------------------------------
+print(paste("Starting", k_folds, "-fold cross-validation..."))
+for (i in 1:k_folds) {
+  print(paste("Processing Fold", i, "/", k_folds))
+
+  # Get indices for training and testing sets
+  train_indices <- folds[[i]]
+  val_indices <- setdiff(1:nrow(my_data), train_indices)
+
+  train_data <- my_data[train_indices, ]
+  val_data <- my_data[val_indices, ]
+
+  # Loop through each lambda value
+  for (j in 1:length(lambdas_to_try)) {
+    current_lambda <- lambdas_to_try[j]
+    # print(paste("  Testing lambda =", current_lambda)) # Uncomment for detailed progress
+
+    # Use tryCatch to handle potential errors during fitting for certain lambdas
+    fit_attempt <- tryCatch({
+        glmmLasso(
+          fix = fixed_formula,
+          rnd = list(agency_id = ~1),
+          data = train_data,
+          family = binomial(link = "logit"),
+          lambda = current_lambda,
+          switch.NR = FALSE, # Often faster convergence for intermediate steps
+          final.re = FALSE,  # Don't need final RE estimate for prediction tuning here
+          control = list(center = TRUE, standardize = TRUE, 
+                         print.iter = FALSE, maxIter = 200) # Standardize predictors
+      )
+    }, error = function(e) {
+      stopCluster(cl)
+      print(paste("Error fitting model for lambda =", 
+                  current_lambda, "in fold", i, ":", e$message))
+      return(NULL) # Return NULL if fitting fails
+    })
+
+    # If fitting was successful, predict on test set and calculate AUC-PR
+    if (!is.null(fit_attempt)) {
+      # Predict probabilities on the test set
+      # Note: Prediction with new data/groups in glmmLasso can be complex.
+      # Here, we predict on the test set, assuming groups might overlap or
+      # using only fixed effects if groups are entirely new (check predict.glmmLasso documentation).
+      # For simplicity, we use the standard predict which might use estimated random effects
+      # if group levels exist in the training data. A safer approach for pure out-of-sample
+      # performance might involve predicting with random effects set to 0.
+      predictions <- tryCatch({
+          predict(fit_attempt, newdata = val_data, 
+                  type = "response") # Get probabilities
+      }, error = function(e) {
+          stopCluster(cl)
+          print(paste("Error predicting for lambda =", 
+                      current_lambda, "in fold", i, ":", e$message))
+          return(NULL)
+      })
+
+      if (!is.null(predictions) && length(predictions) == nrow(val_data)) {
+           # Ensure no NA/NaN/Inf values in predictions or actuals
+           valid_preds <- is.finite(predictions)
+           valid_actuals <- is.finite(val_data$outcome_numeric[valid_preds])
+           
+           final_predictions <- predictions[valid_preds][valid_actuals]
+           final_actuals <- val_data$outcome_numeric[valid_preds][valid_actuals]
+
+           # Check if we have both classes present in the actuals for AUC calculation
+           if (length(unique(final_actuals)) == 2 && length(final_predictions) > 0) {
+               # Calculate AUC-PR using PRROC
+               pr_curve <- pr.curve(scores.class0 = final_predictions[final_actuals == 1],
+                                    scores.class1 = final_predictions[final_actuals == 0], # Note: PRROC input format might seem reversed
+                                    curve = FALSE)
+               cv_auc_pr_results[i, j] <- pr_curve$auc.integral
+           } else {
+               print(paste("    Skipping AUC-PR calculation for lambda =", 
+                           current_lambda, "in fold", i, 
+                           "- not enough classes or valid predictions."))
+               cv_auc_pr_results[i, j] <- NA # Assign NA if AUC-PR cannot be calculated
+           }
+      } else {
+          cv_auc_pr_results[i, j] <- NA # Assign NA if prediction failed
+      }
+    } else {
+      cv_auc_pr_results[i, j] <- NA # Assign NA if model fitting failed
+    }
+  } # End loop over lambdas
+} # End loop over folds
+
+print("Cross-validation finished.")
+
+#--------------------------------------------------------------------------
+# Analyze CV Results and Select Optimal Lambda
+#--------------------------------------------------------------------------
+# Calculate average AUC-PR across folds for each lambda
+mean_auc_pr <- colMeans(cv_auc_pr_results, na.rm = TRUE)
+
+# Find the lambda that maximizes the average AUC-PR
+optimal_lambda_index <- which.max(mean_auc_pr)
+optimal_lambda <- lambdas_to_try[optimal_lambda_index]
+
+print("CV Results (Mean AUC-PR per Lambda):")
+print(data.frame(Lambda = lambdas_to_try, Mean_AUC_PR = mean_auc_pr))
+print(paste("Optimal Lambda based on max mean AUC-PR:", optimal_lambda))
+
+# Optional: Plot AUC-PR vs Lambda
+# plot(lambdas_to_try, mean_auc_pr, type = "b", xlab = "Lambda", ylab = "Mean AUC-PR", main = "CV Results for glmmLasso")
+# abline(v = optimal_lambda, col = "red", lty = 2)
+
+#--------------------------------------------------------------------------
+# Fit Final Model with Optimal Lambda
+#--------------------------------------------------------------------------
+print(paste("Fitting final glmmLasso model using optimal lambda =", 
+            optimal_lambda))
+
+m_glmmLasso <- glmmLasso(
+  fix = fixed_formula,
+  rnd = list(agency_id = ~1),
+  data = my_data, # Use the full dataset
+  family = binomial(link = "logit"),
+  lambda = optimal_lambda,
+  switch.NR = TRUE, # Use NR for final fit for potentially better precision
+  final.re = TRUE,  # Re-estimate random effects variance
+  control = list(center = TRUE, standardize = TRUE, 
+                 print.iter = TRUE) # Standardize predictors
+)
+
+# --- Inspect Final Model Results ---
+print("Summary of Final glmmLasso model:")
+summary(m_glmmLasso)
+
+print("Final Fixed Effects Coefficients (glmmLasso):")
+print(m_glmmLasso$coefficients) # Note which coefficients were shrunk to zero
+
+stopCluster(cl)
+beepr::beep(1)
+```
+
+```{r clean_up}
+rm(train_data, val_data, optimal_lambda_index, 
+   valid_preds, valid_actuals, final_predictions, 
+   final_actuals, predictions, fit_attempt, 
+   train_data, val_data, train_indices, val_indices,
+   predictors, formula_str, k_folds, lambdas_to_try, 
+   my_data, linearCombos, fixed_formula)
+```
+
+# Multilevel Linear Model
+
+```{r m_glmm}
+
+```
+
+# Elastic Net
+
+```{r m_enet}
+set.seed(1234)
+
+train_yearFE_noID <- train_yearFE |>
+  select(-agency_id)
+  
+# Define a grid over alpha and lambda
+tuneGrid <- expand.grid(
+  alpha = seq(0, 1, length.out = 11), # from 0 (ridge) to 1 (lasso)
+  lambda = 10^seq(-3, 1, length.out = 50) # a sequence of lambda values on a log scale
+)
+
+# Calculate class weights by index
+class_counts <- table(train_yearFE_noID$extreme_closure_10pct_over_5yr)
+train_weights <- ifelse(train_yearFE_noID$extreme_closure_10pct_over_5yr == "X1",
+                        sum(class_counts) / (2 * class_counts["X1"]),
+                        sum(class_counts) / (2 * class_counts["X0"]))
+
+# Set train control
+trControl <- trainControl(method = "cv",
+                          number = 5,  
+                          classProbs = TRUE, 
+                          index = folds,
+                          returnResamp = 'all',
+                          savePredictions = 'final',
+                          summaryFunction = prSummary) 
+
+# Enable parallel processing
+# cl <- makeCluster(detectCores() - 4)
+# registerDoParallel(cl)
+
+# Train the model with grid search over the specified hyperparameters
+beepr::beep_on_error(
+  m_enet <- train(
+    extreme_closure_10pct_over_5yr ~ .,
+    data = train_yearFE_noID,
+    method = "glmnet",
+    family = "binomial",
+    trControl = trControl,
+    tuneGrid = tuneGrid,
+    preProcess = c("center", "scale", 'nzv'),
+    metric = 'AUC', 
+    weights = train_weights 
+  ), 9
+)
+
+# Stop parallel cluster
+# stopCluster(cl)
+beepr::beep(1)
+rm(trControl, class_counts, train_weights, tuneGrid)
+```
+
+```{r eval_enet}
+m_enet_CV_AUC <- m_enet$resample |> 
+  filter(alpha == m_enet$bestTune$alpha, 
+         lambda == m_enet$bestTune$lambda) |> 
+  pull(AUC) |> mean()
+
+print(paste0("The CV estimate for AUC is: ", m_enet_CV_AUC))
+
+m_enet_CV_Recall <- m_enet$resample |> 
+  filter(alpha == m_enet$bestTune$alpha, 
+         lambda == m_enet$bestTune$lambda) |> 
+  pull(Recall) |> mean()
+
+print(paste0("The CV estimate for Recall is: ", m_enet_CV_Recall))
+
+predictions_train_enet_yearFE <- predict(m_enet, train_yearFE_noID)
+caret::confusionMatrix(predictions_train_enet_yearFE,
+                       train_yearFE_noID$extreme_closure_10pct_over_5yr,
+                       positive = 'X1')
+# plot(m_enet)
+```
+
+```{r prauc_enet}
+predictions_train_enet_probs <- predict(m_enet, train_yearFE, type = "prob")
+scores_positive <- predictions_train_enet_probs["X1"] |> pull()
+scores_negative <- predictions_train_enet_probs["X0"] |> pull()
+
+pr_curve_enet <- PRROC::pr.curve(
+  scores.class0 = scores_positive,
+  scores.class1 = scores_negative, # Neg class is class1 for PRROC
+  curve = TRUE)
+
+cv_auc_pr_enet <- pr_curve_enet$auc.integral
+#print(paste("Cross-Validated Area Under PR Curve (AUC-PR) using provided folds:", 
+#            round(cv_auc_pr_enet, 4)))
+plot(pr_curve_enet)
+rm(scores_negative, scores_positive)
+```
+
+# Random Forest
+
+```{r num_predictors}
+# Find the number of predictors for tuning mtry, recommended values is sqrt(num_preds)
+# Assuming 'your_data' is your data frame and 'outcome_variable' is the name of your response variable column
+# Exclude the outcome variable if it's currently in the data frame
+my_data <- data_5yr_base_omit_splits$train_original
+predictors_only <- my_data[, !(names(my_data) %in% c("agency_id",
+                                                     "extreme_closure_10pct_over_5yr"))]
+
+# Create the dummy variable transformation object
+# Use fullRank = FALSE for typical one-hot encoding for RF
+dmy <- caret::dummyVars(" ~ .", 
+                        data = predictors_only, 
+                        fullRank = FALSE)
+
+design_matrix <- predict(dmy, newdata = predictors_only)
+
+num_preds <- ncol(design_matrix)
+
+print(num_preds)
+print(sqrt(num_preds))
+rm(predictors_only, dmy, design_matrix, my_data, num_preds)
+```
+
+```{r m_rf}
+# TRAINED IN SHERLOCK, SEE FILE IN SHERLOCK FOLDER
+train_yearFE_noID <- train_yearFE |>
+  select(-agency_id)
+
+# Calculate class weights as a vector
+outcome_var <- train_yearFE_noID$extreme_closure_10pct_over_5yr
+
+# Compute class frequencies
+class_counts <- table(outcome_var)
+majority_count <- max(class_counts)
+minority_count <- min(class_counts)
+
+# Create class weights (inverse of class frequency ratio)
+class_weights <- ifelse(
+  levels(outcome_var) == names(which.max(class_counts)),
+  1,  # Majority class weight
+  majority_count / minority_count  # Minority class weight 
+)
+
+names(class_weights) <- levels(outcome_var)
+
+# Train Random Forest Model
+trControl <- trainControl(method = "cv",
+                          number = 5, 
+                          classProbs = TRUE, 
+                          returnResamp = "all",
+                          index = folds,
+                          sampling = 'down',
+                          summaryFunction = prSummary)
+                          
+rf_grid <- expand.grid(mtry = c(8, 10, 11, 12, 13, 14, 16),
+                       splitrule = c("gini", 
+                                     "extratrees",
+                                     "hellinger"),
+                       min.node.size = c(10, 15, 20, 25, 30))
+
+# Enable parallel processing
+#cl <- makeCluster(detectCores() - 6)
+#registerDoParallel(cl)
+
+beepr::beep_on_error(
+  m_rf <- train(
+    extreme_closure_10pct_over_5yr ~ .,
+    data = train_yearFE_noID, 
+    method = "ranger",
+    tuneGrid = rf_grid,
+    trControl = trControl,
+    metric = 'AUC',
+    importance = "permutation",
+    # class.weights = class_weights,
+    preProcess = c("center", "scale", "nzv")
+  ), 9
+)
+
+#stopCluster(cl)
+rm(outcome_var, class_counts, majority_count, minority_count,
+   class_weights, trControl, rf_grid)
+beepr::beep(1)
+```
+
+```{r load_sherlock_model}
+m_rf <- readRDS("../Sherlock/m_rf3.rds")
+```
+
+```{r check_training_data}
+# Checking to ensure no data leakage
+
+# Weird result where setdiff returns that almost every row doesn't have a match, but manual inspect shows no difference between the sets (and performance on local train dataset matches Sherlock output)
+
+m_rf$trainingData |> 
+  mutate(year = as.factor(year), 
+         across(where(is.integer), as.double), 
+         across(where(is.factor), as.character))
+train_yearFE_noID |> 
+  rename(.outcome = extreme_closure_10pct_over_5yr) |> 
+  mutate(across(where(is.integer), as.double),
+         across(where(is.factor), as.character))
+```
+
+```{r eval_m_rf}
+# print(m_rf)
+
+m_rf_CV_AUC <- m_rf$resample |> 
+  filter(mtry == m_rf$bestTune$mtry, 
+         splitrule == m_rf$bestTune$splitrule, 
+         min.node.size == m_rf$bestTune$min.node.size) |> 
+  pull(AUC) |> mean()
+
+print(paste0("The CV estimate for AUC is: ", m_rf_CV_AUC))
+
+m_rf_CV_Recall <- m_rf$resample |> 
+  filter(mtry == m_rf$bestTune$mtry, 
+         splitrule == m_rf$bestTune$splitrule, 
+         min.node.size == m_rf$bestTune$min.node.size) |> 
+  pull(Recall) |> mean()
+
+print(paste0("The CV estimate for Recall is: ", m_rf_CV_Recall))
+
+predictions_train_rf <- predict(m_rf, train_yearFE)
+print(caret::confusionMatrix(predictions_train_rf,
+                             train$extreme_closure_10pct_over_5yr,
+                             positive = 'X1'))
+
+plot(m_rf)
+```
+
+```{r prauc_rf}
+predictions_train_rf_probs <- predict(m_rf, train_yearFE, type = "prob")
+scores_positive <- predictions_train_rf_probs["X1"] |> pull()
+scores_negative <- predictions_train_rf_probs["X0"] |> pull()
+
+pr_curve_rf <- PRROC::pr.curve(
+  scores.class0 = scores_positive,
+  scores.class1 = scores_negative, # Neg class is class1 for PRROC
+  curve = TRUE)
+
+cv_auc_pr_rf <- pr_curve_rf$auc.integral
+#print(paste("Cross-Validated Area Under PR Curve (AUC-PR) using provided folds:", 
+#            round(cv_auc_pr_rf, 4)))
+plot(pr_curve_rf)
+rm(scores_negative, scores_positive)
+```
+
+# XGBoost
+
+```{r}
+train_yearFE_noID_lag <- train_yearFE %>%
+  group_by(agency_id) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(across(
+    # .cols: Specify which columns to apply the functions to.
+    # 'where(is.numeric)' selects all columns containing numeric data.
+    .cols = where(is.numeric),
+
+    # .fns: Provide a list of functions to apply to the selected columns.
+    # We use anonymous functions (~) with lag(). '.' represents the column data.
+    # The list is named ('lag1', 'lag3', 'lag5') - these names are used in '.names'.
+    .fns = list(
+      lag1 = ~lag(., n = 1), # 1-period lag
+      lag3 = ~lag(., n = 3), # 3-period lag
+      lag5 = ~lag(., n = 5)  # 5-period lag
+    ),
+    .names = "{.col}_lag{sub('lag', '', .fn)}"
+  )) %>%
+  ungroup()
+```
+
+```{r m_xgb_lag}
+# train_yearFE_noID <- train_yearFE |>
+#   select(-agency_id)
+
+train_yearFE_noID_lag_omit <- train_yearFE_noID_lag |> na.omit()
+
+folds_lag <- groupKFold(train_yearFE_noID_lag$agency_id, k = 5)
+
+# Calculate the imbalance ratio for the positive class.
+class_counts <- table(train_yearFE_noID_lag$extreme_closure_10pct_over_5yr)
+scale_pos_weight_val <- as.numeric(class_counts[1] / class_counts[2])
+
+# Define class weights for the positive class
+class_weights <- ifelse(train_yearFE_noID_lag$extreme_closure_10pct_over_5yr == "X1", 
+                        scale_pos_weight_val, 1)
+
+# Define a custom tuning grid for xgbTree.
+#   - nrounds: number of boosting iterations
+#   - max_depth: maximum tree depth for base learners
+#   - eta: learning rate
+#   - gamma: minimum loss reduction for further partitioning (acts as regularization)
+#   - colsample_bytree: subsample ratio of columns when constructing each tree
+#   - min_child_weight: minimum sum of instance weight needed in a child
+#   - subsample: subsample ratio of the training instances
+tuneGrid_xgb <- expand.grid(
+  nrounds = c(100, 150, 200, 300),
+  max_depth = c(3, 5, 9), # range of tree sizes to check overfitting on majority class
+  eta = c(0.05, 
+          # 0.01, 
+          0.1),
+  gamma = c(0, 0.1, 0.5, 0.75),
+  colsample_bytree = c(0.6, 0.8, 1),
+  min_child_weight = c(1, 5, 10),
+  subsample = c(0.8, 1)
+)
+
+# Train XGBoost Model
+trControl <- trainControl(method = "cv",
+                          number = 5, 
+                          classProbs = TRUE, 
+                          returnResamp = "all",
+                          # index = folds,
+                          index = folds_lag,
+                          sampling = 'down',
+                          summaryFunction = prSummary) 
+
+# Enable parallel processing
+# cl <- makeCluster(detectCores() - 8)
+# registerDoParallel(cl)
+
+beepr::beep_on_error(
+  m_xgb <- train(
+    extreme_closure_10pct_over_5yr ~ .,
+    data = train_yearFE_noID_lag,
+    method = "xgbTree",
+    trControl = trControl,  
+    metric = "AUC",
+    tuneGrid = tuneGrid_xgb,
+    preProcess = c("center", "scale", "nzv"),
+    # weights = class_weights, 
+    scale_pos_weight = scale_pos_weight_val,
+    verbose = TRUE
+  ), 9
+)
+
+# stopCluster(cl)
+rm(class_counts, class_weights, scale_pos_weight_val, 
+   tuneGrid_xgb, trControl)
+beepr::beep(1)
+```
+
+```{r load_sherlock_xgb_model}
+# m_xgb <- readRDS("../Sherlock/m_xgb1.rds"), NOTE: trained without lags
+
+m_xgb <- readRDS("../Sherlock/m_xgb3.rds") # NOTE: trained without lags
+```
+
+```{r eval_xgb}
+# print(m_xgb)
+m_xgb_CV_AUC <- m_xgb$resample |> 
+  filter(eta == m_xgb$bestTune$eta,
+         max_depth == m_xgb$bestTune$max_depth,
+         gamma == m_xgb$bestTune$gamma,
+         colsample_bytree == m_xgb$bestTune$colsample_bytree, 
+         min_child_weight == m_xgb$bestTune$min_child_weight, 
+         subsample == m_xgb$bestTune$subsample, 
+         nrounds == m_xgb$bestTune$nrounds) |> 
+  pull(AUC) |> mean()
+
+print(paste0("The CV estimate for AUC is: ", m_xgb_CV_AUC))
+
+m_xgb_CV_Recall <- m_xgb$resample |> 
+  filter(eta == m_xgb$bestTune$eta,
+         max_depth == m_xgb$bestTune$max_depth,
+         gamma == m_xgb$bestTune$gamma,
+         colsample_bytree == m_xgb$bestTune$colsample_bytree, 
+         min_child_weight == m_xgb$bestTune$min_child_weight, 
+         subsample == m_xgb$bestTune$subsample, 
+         nrounds == m_xgb$bestTune$nrounds) |> 
+  pull(Recall) |> mean()
+
+print(paste0("The CV estimate for Recall is: ", m_xgb_CV_Recall))
+
+predictions_train_xgb <- predict(m_xgb, train_yearFE)
+print(caret::confusionMatrix(predictions_train_xgb,
+                             train_yearFE$extreme_closure_10pct_over_5yr,
+                             positive = 'X1'))
+```
+
+```{r prauc_xgb}
+predictions_train_xgb_probs <- predict(m_xgb, train_yearFE, 
+                                       type = "prob")
+scores_positive <- predictions_train_xgb_probs["X1"] |> pull()
+scores_negative <- predictions_train_xgb_probs["X0"] |> pull()
+
+pr_curve_xgb <- PRROC::pr.curve(
+  scores.class0 = scores_positive,
+  scores.class1 = scores_negative, # Neg class is class1 for PRROC
+  curve = TRUE)
+
+cv_auc_pr_xgb <- pr_curve_xgb$auc.integral
+#print(paste("Cross-Validated Area Under PR Curve (AUC-PR) using provided folds:", 
+#            round(cv_auc_pr_rf, 4)))
+plot(pr_curve_xgb)
+rm(scores_negative, scores_positive)
+```
+
+# LSTM
+
+```{r import_performance}
+lstm_perf_data <- read_csv("../Data/lstm_grid_search_results.csv", 
+                           show_col_types = F)
+lstm_fold_metrics <- read_csv("../Data/lstm_fold_metrics.csv", 
+                              show_col_types = F)
+
+lstm_perf_data
+lstm_fold_metrics
+```
+
+# MERF
+
+```{r}
+
+```
+
+# SuperLearner
+
+```{r def_create_inner_cvControls}
+create_inner_cvControls <- function(df) {
+  # Identify fold indicator columns assuming only "agency_id" is non-fold indicator.
+  fold_cols <- setdiff(names(df), "agency_id")
+  
+  # Initialize the list to store cvControl lists for each outer fold.
+  cv_control_list <- vector("list", length = length(fold_cols))
+  
+  # Loop over each fold indicator column.
+  for (i in seq_along(fold_cols)) {
+    current_fold <- fold_cols[i]
+    
+    # Extract the indicator that sets if row is in the training set of the outer fold
+    train_indicator <- df[[current_fold]]
+    
+    # Identify the agencies that are in the outer fold training set.
+    df_fold <- df[train_indicator == 1, ]
+    inner_folds <- groupKFold(df_fold$agency_id, k = 5)
+    
+    # Invert the folds to represent validation indices of the outer fold, not training
+    n_total <- nrow(df_fold) # Total number of observations
+    train_indices_list <- inner_folds
+    
+    # Get all possible row indices
+    all_indices <- seq_len(n_total)
+    
+    # Generate the validation indices list using setdiff
+    #    lapply iterates through each fold's training indices in train_indices_list
+    #    For each set of training indices (train_idx), it finds the indices in
+    #    all_indices that are NOT present in train_idx.
+    folds_validation_indices <- lapply(train_indices_list, function(train_idx) {
+      setdiff(all_indices, train_idx)
+    })
+    
+    # Store the cvControl list for this outer fold.
+    # Set V = 5 inner folds, and validRows as a list of indices for each fold.
+    cv_control_list[[i]] <- list(V = 5, validRows = folds_validation_indices)
+  }
+  
+  return(cv_control_list)
+}
+```
+
+```{r m_SL}
+# Define Variable Names
+# --------------------------
+outcome_variable_name <- "extreme_closure_10pct_over_5yr" 
+cluster_id_variable_name <- "agency_id"
+
+# Automatically determine predictor variables (all columns except outcome and cluster ID)
+all_column_names <- colnames(train_yearFE)
+predictor_variable_names <- setdiff(all_column_names, 
+                                    c(outcome_variable_name, cluster_id_variable_name))
+
+# Prepare Data Subsets for SuperLearner
+# -----------------------------------------
+# Ensure outcome and year are numeric 
+train_yearFE_SL <- train_yearFE |> 
+  mutate(extreme_closure_10pct_over_5yr = 
+           if_else(extreme_closure_10pct_over_5yr == 'X1', 1, 0),
+         year = as.numeric(as.character(year)))
+
+# Pull out outcome and design matrix
+Y <- train_yearFE_SL[[outcome_variable_name]]
+X <- train_yearFE_SL[, predictor_variable_names, drop = FALSE]
+id <- train_yearFE_SL[[cluster_id_variable_name]]
+
+# Calculate class weights based on class imbalance
+# -------------------------------------------------
+# Compute the ratio of negative to positive cases
+n_pos <- sum(Y == 1)
+n_neg <- sum(Y == 0)
+pos_weight <- n_neg / n_pos  # Higher weight for the minority class
+
+# Print class balance information
+print(paste("Positive cases:", n_pos, "(", round(100 * n_pos / length(Y), 2), "%)"))
+print(paste("Negative cases:", n_neg, "(", round(100 * n_neg / length(Y), 2), "%)"))
+print(paste("Positive class weight:", round(pos_weight, 2)))
+
+# Create observation weights vector (1 for negative class, pos_weight for positive class)
+obs_weights <- ifelse(Y == 1, pos_weight, 1)
+
+# Define the Library of Base Learners
+# --------------------------------------
+# Create weighted versions of algorithms
+# Note: Different algorithms handle weights differently
+learner_library <- c(
+  "SL.mean",
+  "SL.glmnet",  # glmnet can use weights directly
+  "SL.ranger.wt",  # Custom wrapper for weighted random forest
+  "SL.xgboost.wt"  # Custom wrapper for weighted xgboost
+)
+
+# Define custom wrappers that incorporate weights
+# -----------------------------------------------
+# Weighted Ranger (Random Forest) wrapper
+SL.ranger.wt <- function(Y, X, newX = NULL, family = gaussian(), obsWeights = NULL, ...) {
+  SL.ranger(Y = Y, X = X, newX = newX, family = family, obsWeights = obsWeights, ...)
+}
+
+# Weighted XGBoost wrapper
+SL.xgboost.wt <- function(Y, X, newX = NULL, family = gaussian(), obsWeights = NULL, ...) {
+  # Convert to matrix format required by xgboost
+  xgmat <- model.matrix(~ . - 1, data = X)
+  
+  # Default parameters
+  params <- list(
+    objective = ifelse(family$family == "binomial", "binary:logistic", "reg:squarederror"),
+    eval_metric = ifelse(family$family == "binomial", "logloss", "rmse"),
+    eta = 0.1,
+    max_depth = 6,
+    nthread = 1,
+    verbose = 0
+  )
+  
+  # If no weights provided, use equal weights
+  if (is.null(obsWeights)) {
+    obsWeights <- rep(1, length(Y))
+  }
+  
+  # Train with weights
+  fit <- xgboost::xgboost(
+    data = xgmat,
+    label = Y,
+    weight = obsWeights,
+    params = params,
+    nrounds = 100,
+    ...
+  )
+  
+  # Predict
+  pred <- NULL
+  if (!is.null(newX)) {
+    newX <- model.matrix(~ . - 1, data = newX)
+    pred <- predict(fit, newX)
+  }
+  
+  # Return
+  fit <- list(object = fit)
+  class(fit) <- "SL.xgboost"
+  out <- list(fit = fit, pred = pred)
+  return(out)
+}
+
+# Specify the Model Family
+# ---------------------------
+family_choice <- binomial()
+
+# Train the SuperLearner Model
+# -------------------------------
+set.seed(1234) # Choose any seed number
+
+# Run SuperLearner
+print("Starting SuperLearner training with class weights...")
+
+cl <- makeCluster(detectCores() - 7)
+registerDoParallel(cl)
+
+print("Generating inner and outer valdiation fold indices from pre-generated training folds...")
+# Get Indices for Outer CV Validation Set from Training Set
+# --------------------------------------
+n_total <- nrow(train_yearFE_SL) # Total number of observations
+train_indices_list <- folds
+
+# Get all possible row indices
+all_indices <- seq_len(n_total)
+
+# Generate the validation indices list using setdiff
+#    lapply iterates through each fold's training indices in train_indices_list
+#    For each set of training indices (train_idx), it finds the indices in
+#    all_indices that are NOT present in train_idx.
+folds_validation_indices <- lapply(train_indices_list, function(train_idx) {
+  setdiff(all_indices, train_idx)
+})
+rm(n_total, train_indices_list, all_indices)
+
+# Set up Outer Cross-Validation Control
+# --------------------------------------
+num_folds <- length(folds)
+cv_control <- list(V = num_folds, 
+                   validRows = folds_validation_indices)
+print(paste("Using pre-defined folds list with", num_folds, "folds."))
+
+# Set up Inner CV folds
+# --------------------------------------
+# Take in set of indicies from outer folds (stored in folds_df)
+# Returns validation sets for each fold based on 5-fold split
+inner_cv_control <- create_inner_cvControls(folds_df)
+
+
+# Train 
+# --------------------------------------
+beepr::beep_on_error(
+  m_SLCV <- CV.SuperLearner(
+    Y = Y,                  # Outcome variable vector (0/1)
+    X = X,                  # Predictor variable data frame
+    family = family_choice, # binomial() for binary outcome
+    SL.library = learner_library, # List of base learning algorithms
+    id = id,                # Cluster identifier for V-fold CV
+    cvControl = cv_control, # Control parameters for CV (includes V=5 folds)
+    control = SuperLearner.control(saveCVFitLibrary = T),
+    method = 'method.CC_nloglik',
+    verbose = T,
+    innerCvControl = inner_cv_control,
+    obsWeights = obs_weights # Add observation weights based on class imbalance
+  ), 9
+)
+
+stopCluster(cl)
+print("SuperLearner training complete.")
+rm(num_folds, family_choice, cv_control, inner_cv_control,
+   inner_valid_rows, inner_folds_by_agency, unique_agencies, 
+   obs_weight, n_pos, n_neg, pos_weight, 
+   outcome_variable_name, cluster_id_variable_name, 
+   all_column_names, predictor_variable_names)
+beepr::beep(1)
+```
+
+```{r load_saved_SL}
+# Sherlock CV Model
+# m_SL <- readRDS('../Sherlock/m_SLCV.rds')
+
+# Sherlock Prediction Model
+m_SL <- readRDS("../Sherlock/m_SL.rds")
+# m_SLCV <- readRDS('../Sherlock/m_SLCV.rds')
+
+# local trained (first run, NNLS, no hyperparam tuning)
+# m_SL <- readRDS('../Data/m_SL1.rds')
+```
+
+```{r eval_SL}
+# m_SL$AllSL
+
+# Evaluate class-weighted model performance
+# -----------------------------------------
+# Get cross-validated predictions
+cv_preds <- m_SL$SL.predict
+
+# Calculate performance metrics with emphasis on minority class
+conf_matrix <- table(Predicted = ifelse(cv_preds > 0.5, 1, 0), 
+                     Actual = Y)
+print("Confusion Matrix:")
+print(conf_matrix)
+
+# Calculate sensitivity (recall) and specificity
+sensitivity <- conf_matrix[2,2] / sum(conf_matrix[,2])
+specificity <- conf_matrix[1,1] / sum(conf_matrix[,1])
+
+print(paste("Sensitivity (True Positive Rate):", round(sensitivity, 4)))
+print(paste("Specificity (True Negative Rate):", round(specificity, 4)))
+
+# Calculate balanced accuracy
+balanced_acc <- (sensitivity + specificity) / 2
+print(paste("Balanced Accuracy:", round(balanced_acc, 4)))
+
+# Calculate F1 score (harmonic mean of precision and recall)
+precision <- conf_matrix[2,2] / sum(conf_matrix[2,])
+f1_score <- 2 * (precision * sensitivity) / (precision + sensitivity)
+print(paste("F1 Score:", round(f1_score, 4)))
+
+scores_positive <- m_SL$SL.predict[Y == 1]
+scores_negative <- m_SL$SL.predict[Y == 0]
+
+pr_curve_SL <- PRROC::pr.curve(
+  scores.class0 = scores_positive,
+  scores.class1 = scores_negative, # Neg class is class1 for PRROC
+  curve = TRUE)
+
+cv_auc_pr_SL <- pr_curve_SL$auc.integral
+print(paste("Area Under PR Curve (AUC-PR) (Cross-validated models):", 
+            round(cv_auc_pr_SL, 4)))
+plot(pr_curve_SL)
+rm(conf_matrix, sensitivity, specificity, balanced_acc, 
+   precision, f1_score, scores_negative, scores_positive)
+```
+
+```{r}
+m_SL$coef
+# m_SL$library.predict # predictions from each library in the ensemble
+```
+
+```{r def_get_cv_prauc_by_fold}
+# Function to calculate PR-AUC for each fold in CV.SuperLearner
+get_cv_prauc_by_fold <- function(cvsl_object) {
+  # Load required package for PR-AUC calculations
+  if (!requireNamespace("PRROC", quietly = TRUE)) {
+    install.packages("PRROC")
+  }
+  library(PRROC)
+  
+  # Initialize storage for PR-AUC values
+  V <- cvsl_object$V
+  fold_prauc <- numeric(V)
+  
+  # Loop through each fold
+  for (i in 1:V) {
+    # Get indices for validation fold
+    val_indices <- cvsl_object$folds[[i]]
+    
+    # Get SuperLearner predictions for this fold
+    sl_preds <- cvsl_object$SL.predict[val_indices]
+    
+    # Get actual outcomes for this fold
+    y_actual <- cvsl_object$Y[val_indices]
+    
+    # Calculate PR-AUC for this fold
+    if (length(unique(y_actual)) > 1) {  # Ensure fold has both classes
+      # Calculate PR curve and AUC using PRROC
+      pr_curve <- PRROC::pr.curve(
+        scores.class0 = sl_preds,  # Predicted probabilities
+        weights.class0 = y_actual,  # True labels (0/1)
+        curve = TRUE
+      )
+      fold_prauc[i] <- pr_curve$auc.integral
+    } else {
+      # Handle case where a fold might have only one class
+      fold_prauc[i] <- NA
+    }
+  }
+  
+  # Return a data frame with fold numbers and their corresponding PR-AUC
+  result <- data.frame(
+    fold = 1:V,
+    prauc = fold_prauc
+  )
+  
+  # Add summary statistics
+  result$mean_prauc <- mean(result$prauc, na.rm = TRUE)
+  result$sd_prauc <- sd(result$prauc, na.rm = TRUE)
+  
+  return(result)
+}
+
+get_cv_prauc_by_fold(m_SLCV)
+```
+
+```{r def_get_SLevals_by_fold}
+get_SLevals_by_fold <- function(cvsl_object) {
+  # Load required package for PR-AUC calculations
+  if (!requireNamespace("PRROC", quietly = TRUE)) {
+    install.packages("PRROC")
+  }
+  library(PRROC)
+  
+  # Initialize storage for PR-AUC and Recall values
+  V <- cvsl_object$V
+  fold_prauc <- numeric(V)
+  fold_recall <- numeric(V)
+  
+  # Loop through each fold
+  for (i in 1:V) {
+    # Get indices for validation fold
+    val_indices <- cvsl_object$folds[[i]]
+    
+    # Get SuperLearner predictions for this fold
+    sl_preds <- cvsl_object$SL.predict[val_indices]
+    
+    # Get actual outcomes for this fold
+    y_actual <- cvsl_object$Y[val_indices]
+    
+    # Calculate PR-AUC for this fold if both classes are present
+    if (length(unique(y_actual)) > 1) {
+      pr_curve <- PRROC::pr.curve(
+        scores.class0 = sl_preds,  # Predicted probabilities for class 1
+        weights.class0 = y_actual,  # True labels (0/1)
+        curve = TRUE
+      )
+      fold_prauc[i] <- pr_curve$auc.integral
+    } else {
+      fold_prauc[i] <- NA
+    }
+    
+    # Calculate recall for this fold using a threshold of 0.5
+    # Only calculate recall if there is at least one positive class; otherwise, assign NA.
+    if (sum(y_actual) > 0) {
+      pred_class <- ifelse(sl_preds >= 0.5, 1, 0)
+      TP <- sum(pred_class == 1 & y_actual == 1)
+      FN <- sum(pred_class == 0 & y_actual == 1)
+      fold_recall[i] <- TP / (TP + FN)
+    } else {
+      fold_recall[i] <- NA
+    }
+  }
+  
+  # Return a data frame with fold numbers, their corresponding PR-AUC and Recall
+  result <- data.frame(
+    fold = 1:V,
+    prauc = fold_prauc,
+    recall = fold_recall
+  )
+  
+  # Add summary statistics for PR-AUC and Recall
+  result$mean_prauc <- mean(result$prauc, na.rm = TRUE)
+  result$sd_prauc <- sd(result$prauc, na.rm = TRUE)
+  result$mean_recall <- mean(result$recall, na.rm = TRUE)
+  result$sd_recall <- sd(result$recall, na.rm = TRUE)
+  
+  return(result)
+}
+get_SLevals_by_fold(m_SLCV)
+```
+
+```{r risk_plot}
+SuperLearner::plot.CV.SuperLearner(m_SL)
+```
+
+```{r m_SL_noCV}
+# Required for out-of-sample prediction
+# All setup identical to above
+
+# Train the SuperLearner Model
+# -------------------------------
+set.seed(1234) # Choose any seed number
+
+# Run SuperLearner
+print("Starting SuperLearner training...")
+
+cl <- makeCluster(detectCores() - 7)
+registerDoParallel(cl)
+
+beepr::beep_on_error(
+  m_SL_noCV <- SuperLearner(
+    Y = Y,                  # Outcome variable vector (0/1)
+    X = X,                  # Predictor variable data frame
+    family = family_choice, # binomial() for binary outcome
+    SL.library = learner_library, # List of base learning algorithms
+    id = id,                # Cluster identifier for V-fold CV
+    cvControl = cv_control, # Control parameters for CV (includes V=5 folds)
+    obsWeights = obs_weight,
+    verbose = TRUE          # Show progress messages
+  ), 9
+)
+
+stopCluster(cl)
+print("SuperLearner training complete.")
+beepr::beep(1)
+```
