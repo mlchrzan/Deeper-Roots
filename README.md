@@ -23,7 +23,7 @@ The goal is to equip district and state leaders with proactive tools to support 
   * XGBoost
   * LSTM Neural Networks
   * SuperLearner Ensemble
-* Found **XGBoost** to be the most performant and generalizable, with high AUC-PR and recall.
+* Found **XGBoost** to be the most performant and generalizable, with passable AUC-PR and high recall.
 * Conducted **error analysis** across subgroups (e.g., district type, urbanicity) to assess bias and improve equity.
 * Provided **policy guidance** on using predictive models to enable equitable school closure planning.
 
