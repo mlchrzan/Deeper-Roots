@@ -33,7 +33,7 @@ library(knitr)
 
 # Abstract
 
-The increasing rate of permanent school closures in U.S. public school districts presents unprecedented challenges for administrators and communities alike. This study develops an early-warning indicator model to predict mass closure events - defined as a district closing at least 10% of its schools - five years in advance. Leveraging administrative data from the National Center for Education Statistics from 2000-2018, we evaluated a suite of supervised machine learning models - including elastic-net regularized logistic regression, random forests, XGBoost, LSTM neural networks, and SuperLearner ensembles - to determine the degree to which they could predict mass closures using enrollment, financial, and demographic predictors. Comparative analysis based on Area Under the Precision–Recall Curve (AUC-PR), and Recall revealed that XGBoost provided predictive accuracy while effectively handling class imbalance. Our findings demonstrate the technical feasibility of using advanced analytics in educational settings and also offer a glimpse into their potential for generating actionable insights for policymakers to proactively manage resources and support equitable decision-making in the face of systemic challenges. To this end, we include a case study of The School District of Philadelphia’s mass school closures between 2012 and 2013 which this model predicts in 2007 which includes recommendations districts could use based on our predictions.
+The increasing rate of permanent school closures in U.S. public school districts presents unprecedented challenges for administrators and communities alike. This study develops an early-warning indicator model to predict mass closure events - defined as a district closing at least 10% of its schools - five years in advance. Leveraging administrative data from the National Center for Education Statistics from 2000-2018, we evaluated a suite of supervised machine learning models - including elastic-net regularized logistic regression, random forests, XGBoost, LSTM neural networks, and SuperLearner ensembles - to determine the degree to which they could predict mass closures using enrollment, financial, and demographic predictors. Comparative analysis based on Area Under the Precision–Recall Curve (AUC-PR), and Recall revealed that XGBoost provided predictive accuracy while effectively handling class imbalance. Our findings demonstrate the technical feasibility of using advanced analytics in educational settings and also offer a glimpse into their potential for generating actionable insights for policymakers to proactively manage resources and support equitable decision-making in the face of systemic challenges. To this end, we include a case study of The School District of Philadelphia’s mass school closures between 2012 and 2013 (which this model correctly predicts) which includes recommendations districts could use based on our predictions.
 
 # 1. Introduction
 
@@ -688,6 +688,16 @@ For LSTM, the optimal hyperparameters were batch_size = 32, dropout_rate = 0.2, 
 \caption{Distributions of Numeric Predictors Between Correct and Incorrect Predictions, with Incorrect Predictions Broken Down by Type. This figure illustrates the distribution of numeric predictors across correct predictions (blue) and incorrect predictions, further categorized into false negatives (orange) and false positives (purple). Each panel represents a specific predictor variable, comparing the distributions for correct and incorrect classifications. The visualizations highlight differences in predictor values that may contribute to classification errors, offering insights into model behavior and potential areas for improvement. Note: Some predictors have been log-transformed in order to be more carefully examined.}
 \label{fig:A4}
 \end{sidewaysfigure}
+
+\clearpage
+
+\newpage
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{Visuals/Capstone Poster.jpg}
+\caption{Appendix A5 - Project Poster: This poster was presented at the Stanford Graduate School of Education's Education Data Science Symposium, 2025.}
+\end{figure*}
 
 \clearpage
 
