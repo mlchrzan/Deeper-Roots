@@ -32,6 +32,10 @@ train_yearFE$extreme_closure_10pct_over_5yr <-
 # Save training data from omitted dataset
 train_yearFE |> 
   write_csv(file = "../Data/data_5yr_base_omit_TRAIN_yearFE.csv")
+
+# Save and preserve variable types
+train_yearFE |> 
+  saveRDS(file = "../Data/data_5yr_base_omit_TRAIN_yearFE.rds")
 ```
 
 # All Predictors
